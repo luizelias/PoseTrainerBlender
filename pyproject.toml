@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.12", "numpy>=1.23"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pose-trainer-blender"
+version = "0.1.0"
+description = "Blender add-on and C++ Python extension for Pose Trainer deformation"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.scikit-build]
+cmake.minimum-version = "3.20"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/pose_trainer_core", "src/pose_trainer_blender"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
