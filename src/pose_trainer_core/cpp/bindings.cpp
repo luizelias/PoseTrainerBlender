@@ -131,6 +131,7 @@ PYBIND11_MODULE(_pose_trainer_core, m) {
   py::class_<PoseTrainerSettings>(m, "PoseTrainerSettings")
       .def(py::init<>())
       .def_readwrite("relax_iterations", &PoseTrainerSettings::relax_iterations)
+      .def_readwrite("area_relax_iterations", &PoseTrainerSettings::area_relax_iterations)
       .def_readwrite("solve_iterations", &PoseTrainerSettings::solve_iterations)
       .def_readwrite("rbf_radius", &PoseTrainerSettings::rbf_radius)
       .def_readwrite("regularization", &PoseTrainerSettings::regularization);

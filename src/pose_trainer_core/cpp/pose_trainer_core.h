@@ -17,6 +17,7 @@ struct Vec3 {
 
 struct PoseTrainerSettings {
   int relax_iterations = 10;
+  int area_relax_iterations = 0;
   int solve_iterations = 1;
   float rbf_radius = 0.1f;
   float regularization = 0.001f;

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import bpy
 import numpy as np
+from bpy.app.handlers import persistent
 
 from .core_loader import load_core
 
@@ -136,6 +138,12 @@ def train_scene(context: bpy.types.Context) -> None:
     core = load_core()
     core_settings = core.PoseTrainerSettings()
     core_settings.relax_iterations = settings.relax_iterations
+    if not hasattr(core_settings, "area_relax_iterations"):
+        raise RuntimeError(
+            "Installed Pose Trainer C++ core is outdated. Close Blender completely, "
+            "then reinstall dist/pose_trainer_blender_addon.zip so the new core binary is loaded."
+        )
+    core_settings.area_relax_iterations = settings.area_relax_iterations
     core_settings.solve_iterations = settings.solve_iterations
     core_settings.rbf_radius = settings.rbf_radius
     core_settings.regularization = settings.regularization
@@ -147,15 +155,14 @@ def train_scene(context: bpy.types.Context) -> None:
     _ensure_output(settings, source_snapshot)
 
 
-def evaluate_scene(context: bpy.types.Context) -> None:
-    settings = context.scene.pose_trainer
-    cache = _CACHE_BY_SCENE_ID.get(_scene_key(context.scene))
+def _evaluate_scene_with_depsgraph(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
+    settings = scene.pose_trainer
+    cache = _CACHE_BY_SCENE_ID.get(_scene_key(scene))
     if cache is None:
         raise ValueError("Train before evaluating")
     if settings.source_object is None:
         raise ValueError("Choose a source object")
 
-    depsgraph = context.evaluated_depsgraph_get()
     source_snapshot = _evaluated_mesh_snapshot(settings.source_object, depsgraph)
     output = _ensure_output(settings, source_snapshot)
     mask = _vertex_group_weights(settings.source_object, settings.mask_group, len(source_snapshot.positions), 1.0)
@@ -163,31 +170,48 @@ def evaluate_scene(context: bpy.types.Context) -> None:
     _write_output_mesh(output, positions)
 
 
-def _depsgraph_handler(scene: bpy.types.Scene, _depsgraph: bpy.types.Depsgraph) -> None:
+def evaluate_scene(context: bpy.types.Context) -> None:
+    _evaluate_scene_with_depsgraph(context.scene, context.evaluated_depsgraph_get())
+
+
+def _live_update_scene(scene: bpy.types.Scene, depsgraph: Optional[bpy.types.Depsgraph] = None) -> None:
     global _HANDLER_RUNNING
     if _HANDLER_RUNNING:
         return
     settings = getattr(scene, "pose_trainer", None)
     if settings is None or not settings.live_update or not settings.trained:
         return
-    context = bpy.context
-    if context.scene != scene:
-        return
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
     try:
         _HANDLER_RUNNING = True
-        evaluate_scene(context)
+        _evaluate_scene_with_depsgraph(scene, depsgraph)
     except Exception as exc:
         settings.status = str(exc)
     finally:
         _HANDLER_RUNNING = False
 
 
+@persistent
+def _depsgraph_handler(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
+    _live_update_scene(scene, depsgraph)
+
+
+@persistent
+def _frame_change_handler(scene: bpy.types.Scene, depsgraph: Optional[bpy.types.Depsgraph] = None) -> None:
+    _live_update_scene(scene, depsgraph)
+
+
 def register_handlers() -> None:
     if _depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_depsgraph_handler)
+    if _frame_change_handler not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_frame_change_handler)
 
 
 def unregister_handlers() -> None:
     if _depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_depsgraph_handler)
+    if _frame_change_handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_frame_change_handler)
     _CACHE_BY_SCENE_ID.clear()

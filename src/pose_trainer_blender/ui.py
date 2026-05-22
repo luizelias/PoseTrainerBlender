@@ -54,6 +54,7 @@ class PT_PT_panel(bpy.types.Panel):
         layout.separator()
         grid = layout.grid_flow(columns=2, even_columns=True)
         grid.prop(settings, "relax_iterations")
+        grid.prop(settings, "area_relax_iterations")
         grid.prop(settings, "solve_iterations")
         grid.prop(settings, "rbf_radius")
         grid.prop(settings, "regularization")

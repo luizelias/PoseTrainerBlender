@@ -20,8 +20,8 @@ Preferred product shape:
 
 ## Current Project State
 
-This handoff was last updated after adding and smoke-testing a Blender-side UV
-shell extraction tool for Pose Trainer deformation areas.
+This handoff was last updated after adding a C++ `Area Relax` setting for
+blurring deformation-area masks before Pose Trainer training.
 
 Implemented in this repository:
 
@@ -43,6 +43,17 @@ Implemented in this repository:
     across adjacent face shells.
   - Runtime glue reads evaluated source/bind/sample meshes and writes an output
     mesh object.
+  - Live update is registered on both `depsgraph_update_post` and
+    `frame_change_post`, so timeline scrubbing/playback should refresh the
+    generated output mesh after training.
+  - Envelope is a Blender property in the UI. It is passed to the C++ core as
+    `mix(evaluated_source, pose_trainer_result, envelope * vertex_mask)`, so
+    `0.0` is source passthrough and `1.0` is full deformation. Changing the
+    property after training triggers a fresh output evaluation.
+  - `Area Relax` is a Blender property passed into the C++ core as
+    `PoseTrainerSettings.area_relax_iterations`. It blurs deformation-area
+    weights on the mesh topology before representative vertex sampling and RBF
+    training, matching the Mush-style mask relax workflow.
 - C++ Python extension:
   - `src/pose_trainer_core/cpp`
   - Uses Eigen explicitly for Procrustes/SVD and RBF linear solves.
@@ -93,10 +104,20 @@ Installed/verified locally:
   `bpy.ops.pose_trainer.extract_areas_from_uv_shells()` created two
   `PT_UVShell_###` groups from a seam-split UV mesh. Seam vertices were weighted
   `0.5 / 0.5`, confirming Mush-style adjacent-face shell normalization.
+- A Blender 5.1 background smoke test trained a simple shape-key animated mesh,
+  enabled live update, changed frames, and confirmed the output mesh vertices
+  changed. Both live handlers were registered.
+- A Blender 5.1 background smoke test confirmed Envelope `0.0` exactly matches
+  the source mesh and Envelope `1.0` differs with the full deformation.
+- The local C++ test suite includes a contract test confirming that
+  `area_relax_iterations` changes the trained/evaluated result. The Blender 5.1
+  Python 3.13 binary was rebuilt and verified to expose
+  `PoseTrainerSettings.area_relax_iterations`.
 - Reinstalling the full zip while another Blender process had the core `.pyd`
   loaded hit a Windows file lock. The installed add-on's Python files were
-  updated in place under Blender 5.1's user add-ons folder; rerun the normal zip
-  install after closing Blender if a clean install is needed.
+  updated in place under Blender 5.1's user add-ons folder. The `.pyd` may still
+  be locked while Blender is running; rerun the normal zip install after closing
+  Blender so the new C++ core binary is copied into the installed add-on.
 
 Important current limitations:
 
@@ -105,6 +126,8 @@ Important current limitations:
 - Area weights are still passed as dense per-area arrays; optimized CSR packing
   and cache serialization are not implemented yet.
 - Cache invalidation/topology fingerprinting is not complete.
+- Changing `Area Relax`, mesh relax iterations, RBF radius, or regularization
+  marks the cache stale and requires retraining.
 - UV shell extraction currently creates Blender vertex groups from the source
   mesh's active UV map; it has not yet been stress-tested on complex mirrored,
   stacked, or UDIM layouts in Blender.

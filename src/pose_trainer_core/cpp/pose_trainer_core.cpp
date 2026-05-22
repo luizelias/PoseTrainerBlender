@@ -142,6 +142,29 @@ std::vector<Vec3> relax(
   return current;
 }
 
+std::vector<float> relax_weights(
+    const std::vector<float>& weights,
+    const std::vector<std::vector<uint32_t>>& neighbors,
+    int iterations) {
+  std::vector<float> current = weights;
+  for (int iter = 0; iter < std::max(0, iterations); ++iter) {
+    std::vector<float> next = current;
+    for (size_t v = 0; v < current.size(); ++v) {
+      const auto& ring = neighbors[v];
+      if (ring.empty()) {
+        continue;
+      }
+      float total = current[v];
+      for (uint32_t n : ring) {
+        total += current[n];
+      }
+      next[v] = std::clamp(total / static_cast<float>(ring.size() + 1), 0.0f, 1.0f);
+    }
+    current.swap(next);
+  }
+  return current;
+}
+
 Matrix3f procrustes_rotation(
     const std::array<Vec3, kRepresentativeVertexCount>& src,
     const std::array<Vec3, kRepresentativeVertexCount>& dst) {
@@ -330,8 +353,8 @@ PoseTrainerCache train(
     AreaModel model;
     model.name = input.name;
     model.area_id = static_cast<uint32_t>(area_index);
-    model.vertex_weights = input.weights;
-    model.reps = sample_reps(cache.bind_relaxed, input.weights);
+    model.vertex_weights = relax_weights(input.weights, cache.neighbors, settings.area_relax_iterations);
+    model.reps = sample_reps(cache.bind_relaxed, model.vertex_weights);
 
     const auto bind_feature = gather_reps(cache.bind_relaxed, model.reps);
     model.features.resize(sample_count * kRepresentativeVertexCount);
