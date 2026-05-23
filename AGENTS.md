@@ -20,8 +20,11 @@ Preferred product shape:
 
 ## Current Project State
 
-This handoff was last updated after adding a C++ `Area Relax` setting for
-blurring deformation-area masks before Pose Trainer training.
+This handoff was last updated after replacing the generic neighbor-CSR relax
+path with Mush3D-style half-edge relax traversal in both CPU and OpenCL paths.
+The OpenCL profiler was then corrected to use `CL_PROFILING_COMMAND_START`
+instead of the queued timestamp, so `relax` no longer includes accumulated queue
+wait time.
 
 Implemented in this repository:
 
@@ -54,6 +57,45 @@ Implemented in this repository:
     `PoseTrainerSettings.area_relax_iterations`. It blurs deformation-area
     weights on the mesh topology before representative vertex sampling and RBF
     training, matching the Mush-style mask relax workflow.
+  - `Profile Timing` shows the last training/evaluation timing breakdown in
+    separate readable UI lines: total/backend, Blender/core glue timing, and
+    OpenCL GPU event buckets when the OpenCL backend is used. The GPU line is
+    formatted as `GPU wall ... | up ..., relax ..., areas ..., apply ..., read
+    ... ms`; bucket values are summed command execution time, not queued wait.
+  - The panel includes a `Copy Timing` button that copies the latest train/eval
+    timing breakdown to the system clipboard.
+  - Runtime evaluation reads only evaluated positions by default. Face lists are
+    read only when creating/rebuilding the output mesh topology.
+  - The C++ core packs nonzero active vertices/weights per deformation area at
+    training time and precomputes total area coverage. Runtime no longer scans
+    every vertex for every area just to skip zero weights.
+  - The C++ extension now has an optional OpenCL backend. It dynamically loads
+    `OpenCL.dll`/`libOpenCL`, so no OpenCL headers or link libraries are
+    required at build time.
+  - The C++ core builds Mush3D-compatible half-edge topology tables:
+    `halfedge_twin`, `halfedge_next`, `halfedge_vertex`, and
+    `vertex_halfedge`. Boundary vertices intentionally prefer a boundary
+    outgoing half-edge, matching `REFERENCE/wasm/mesh/HalfEdgeBuilder.cpp`.
+  - Mesh relaxation now follows the reference `pose-trainer-relax.wgsl`
+    traversal, including the boundary walk via previous half-edge -> twin.
+    CPU training relax, CPU fallback evaluation relax, and OpenCL runtime relax
+    use the same half-edge semantics. Do not replace this with a generic
+    adjacency average or fused shortcut, because matching Mush3D deformation is
+    higher priority than relax-specific micro-optimizations.
+  - Area mask relaxation was also moved to the same half-edge one-ring averaging
+    behavior used by Mush3D dense area relax, instead of self-inclusive neighbor
+    averaging.
+  - OpenCL currently accelerates runtime mesh relaxation, per-area RBF
+    activation, per-area Procrustes rotation, and final per-vertex delta
+    application. Runtime reads back only the final output positions for Blender
+    mesh write-back. The OpenCL queue now avoids hard `clFinish` calls between
+    relax/evaluate/apply kernels, uploads the animated positions once per
+    evaluation, reuses the mask buffer unless the mask values change, and caches
+    static relax kernel arguments so each half-edge relax iteration only resets
+    the ping-pong input/output buffers.
+  - Blender UI has a `Backend` selector: Auto, CPU, OpenCL. Auto tries OpenCL
+    and falls back to CPU; OpenCL requires the backend and reports an error if
+    unavailable.
 - C++ Python extension:
   - `src/pose_trainer_core/cpp`
   - Uses Eigen explicitly for Procrustes/SVD and RBF linear solves.
@@ -113,6 +155,31 @@ Installed/verified locally:
   `area_relax_iterations` changes the trained/evaluated result. The Blender 5.1
   Python 3.13 binary was rebuilt and verified to expose
   `PoseTrainerSettings.area_relax_iterations`.
+- Profiling diagnostics are Python-side only and do not change C++ math. Use
+  the `Profile Timing` checkbox in the Pose Trainer panel to identify whether
+  the bottleneck is Blender read/write/mask glue or C++ evaluation.
+- A profile from `SAM.blend` showed roughly `Eval 203 ms | C++ 197 ms, write
+  4 ms`, so the current bottleneck is the C++ evaluation path, not Blender mesh
+  write-back. The first active-vertex packing optimization was built for both
+  local Python 3.12 and Blender 5.1/Python 3.13, and packaged into
+  `dist/pose_trainer_blender_addon.zip`. Blender was open, so the installed
+  `.pyd` could not yet be replaced in-place.
+- Local Python 3.12 and Blender 5.1/Python 3.13 builds verified OpenCL is
+  available on this machine. Tiny exact-sample CPU-vs-OpenCL output matched
+  exactly; a 16-vertex non-flat grid matched within about `1.6e-6`. After the
+  queue cleanup, local tests passed and a tiny OpenCL smoke run reported timing
+  like `GPU up ..., relax ..., areas ..., apply ..., read ... ms`.
+- The Blender 5.1/Python 3.13 wheel was rebuilt after the OpenCL queue cleanup,
+  `dist/pose_trainer_blender_addon.zip` was regenerated, the installed Blender
+  5.1 add-on folder was updated while Blender was closed, and a background
+  Blender smoke test reported OpenCL backend plus GPU timing successfully.
+- The Blender 5.1/Python 3.13 wheel was rebuilt again after the half-edge relax
+  port, the installed add-on was updated, and a background Blender smoke test
+  confirmed CPU/OpenCL output matched exactly on the test mesh with OpenCL
+  initialized.
+- The Blender 5.1/Python 3.13 wheel was rebuilt after the OpenCL profiler fix
+  and relax static-argument cleanup. Background Blender smoke test reported
+  `GPU wall ... | ...` timing and CPU/OpenCL max diff `0.0` on the test mesh.
 - Reinstalling the full zip while another Blender process had the core `.pyd`
   loaded hit a Windows file lock. The installed add-on's Python files were
   updated in place under Blender 5.1's user add-ons folder. The `.pyd` may still
@@ -139,13 +206,16 @@ Important current limitations:
 
 Recommended next step:
 
-1. Improve topology/cache validation and error reporting.
-2. Implement training cache save/load and invalidation fingerprints.
-3. Replace dense area loops with CSR-packed area memberships in the C++ API.
-4. Add more C++ tests for Procrustes, RBF activation, simplex projection, and
+1. Test the half-edge OpenCL relax timing on a real rig and compare deformation
+   visually against the previous build/Mush3D expectations.
+2. Test the new `GPU up/relax/areas/apply/read` timing buckets on a real rig and
+   use the largest bucket to guide the next performance pass.
+3. Improve topology/cache validation and error reporting.
+4. Implement training cache save/load and invalidation fingerprints.
+5. Add more C++ tests for Procrustes, RBF activation, simplex projection, and
    bind/sample weighting behavior.
-5. Test live depsgraph updates with actual Blender animation/modifier stacks.
-6. Then add bake/export tooling and performance tuning/parallelism.
+6. Test live depsgraph updates with actual Blender animation/modifier stacks.
+7. Then add bake/export tooling and performance tuning/parallelism.
 
 ## Performance Boundary
 

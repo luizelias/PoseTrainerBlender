@@ -23,6 +23,7 @@ CLASSES = (
     operators.PT_OT_create_output,
     operators.PT_OT_train,
     operators.PT_OT_evaluate_once,
+    operators.PT_OT_copy_profile_timing,
     operators.PT_OT_toggle_live_update,
     ui.PT_UL_samples,
     ui.PT_UL_areas,

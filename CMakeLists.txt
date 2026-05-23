@@ -17,6 +17,7 @@ endif()
 
 pybind11_add_module(_pose_trainer_core
   src/pose_trainer_core/cpp/bindings.cpp
+  src/pose_trainer_core/cpp/opencl_backend.cpp
   src/pose_trainer_core/cpp/pose_trainer_core.cpp
 )
 

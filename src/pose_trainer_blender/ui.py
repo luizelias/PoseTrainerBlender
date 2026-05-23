@@ -56,6 +56,7 @@ class PT_PT_panel(bpy.types.Panel):
         grid.prop(settings, "relax_iterations")
         grid.prop(settings, "area_relax_iterations")
         grid.prop(settings, "solve_iterations")
+        grid.prop(settings, "runtime_backend")
         grid.prop(settings, "rbf_radius")
         grid.prop(settings, "regularization")
         layout.prop(settings, "envelope", slider=True)
@@ -66,4 +67,15 @@ class PT_PT_panel(bpy.types.Panel):
         row.operator("pose_trainer.evaluate_once", icon="FILE_REFRESH")
         icon = "PAUSE" if settings.live_update else "PLAY"
         layout.operator("pose_trainer.toggle_live_update", icon=icon, depress=settings.live_update)
-        layout.label(text=settings.status)
+        layout.prop(settings, "profile_timing")
+        if settings.last_train_timing:
+            layout.label(text=settings.last_train_timing)
+        if settings.profile_timing and settings.last_eval_timing:
+            layout.label(text=settings.last_eval_timing)
+            if settings.last_eval_blender_timing:
+                layout.label(text=settings.last_eval_blender_timing)
+            if settings.last_eval_gpu_timing:
+                layout.label(text=settings.last_eval_gpu_timing)
+            layout.operator("pose_trainer.copy_profile_timing", text="Copy Timing")
+        if not (settings.profile_timing and settings.last_eval_timing and settings.status.startswith(settings.last_eval_timing)):
+            layout.label(text=settings.status)

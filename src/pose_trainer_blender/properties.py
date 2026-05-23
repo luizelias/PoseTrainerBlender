@@ -76,6 +76,16 @@ class PT_Settings(bpy.types.PropertyGroup):
         max=5,
         update=_refresh_output_after_setting_change,
     )
+    runtime_backend: bpy.props.EnumProperty(
+        name="Backend",
+        items=(
+            ("0", "Auto", "Use OpenCL when available, otherwise use CPU"),
+            ("1", "CPU", "Use the Eigen C++ CPU evaluator"),
+            ("2", "OpenCL", "Require the OpenCL runtime evaluator"),
+        ),
+        default="0",
+        update=_refresh_output_after_setting_change,
+    )
     rbf_radius: bpy.props.FloatProperty(
         name="RBF Radius",
         default=0.1,
@@ -98,6 +108,15 @@ class PT_Settings(bpy.types.PropertyGroup):
     )
 
     live_update: bpy.props.BoolProperty(name="Live Update", default=False)
+    profile_timing: bpy.props.BoolProperty(
+        name="Profile Timing",
+        default=False,
+        description="Show per-evaluation timing for Blender read/write glue and C++ deformation",
+    )
+    last_eval_timing: bpy.props.StringProperty(name="Last Eval Timing", default="", options={"SKIP_SAVE"})
+    last_eval_blender_timing: bpy.props.StringProperty(name="Last Eval Blender Timing", default="", options={"SKIP_SAVE"})
+    last_eval_gpu_timing: bpy.props.StringProperty(name="Last Eval GPU Timing", default="", options={"SKIP_SAVE"})
+    last_train_timing: bpy.props.StringProperty(name="Last Train Timing", default="", options={"SKIP_SAVE"})
     trained: bpy.props.BoolProperty(name="Trained", default=False, options={"SKIP_SAVE"})
     status: bpy.props.StringProperty(name="Status", default="Not trained", options={"SKIP_SAVE"})
 

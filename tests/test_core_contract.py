@@ -125,3 +125,29 @@ def test_evaluate_returns_finite_positions():
 
     assert out.shape == sample.shape
     assert np.isfinite(out).all()
+
+
+def test_opencl_matches_cpu_on_tiny_mesh_when_available():
+    if not hasattr(core, "opencl_available") or not core.opencl_available():
+        pytest.skip("OpenCL runtime is not available")
+
+    settings = core.PoseTrainerSettings()
+    settings.relax_iterations = 1
+    bind = _square_bind()
+    sample = bind.copy()
+    sample[2, 2] = 0.5
+
+    cache = core.train(
+        _square_faces(),
+        bind,
+        [sample],
+        [{"name": "all", "weights": np.ones(len(bind), dtype=np.float32)}],
+        settings,
+    )
+
+    cpu = cache.evaluate(sample, None, 1.0, 1, 1)
+    opencl = cache.evaluate(sample, None, 1.0, 1, 2, True)
+
+    assert getattr(cache, "last_backend", "") == "OpenCL"
+    assert hasattr(cache, "last_opencl_timing")
+    assert np.allclose(opencl, cpu, atol=1.0e-5)

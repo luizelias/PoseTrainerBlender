@@ -303,6 +303,36 @@ class PT_OT_evaluate_once(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class PT_OT_copy_profile_timing(bpy.types.Operator):
+    bl_idname = "pose_trainer.copy_profile_timing"
+    bl_label = "Copy Timing"
+    bl_description = "Copy the latest Pose Trainer timing breakdown to the clipboard"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = get_settings(context)
+        lines = []
+        if settings.last_train_timing:
+            lines.append(settings.last_train_timing)
+        if settings.last_eval_timing:
+            lines.append(settings.last_eval_timing)
+        if getattr(settings, "last_eval_blender_timing", ""):
+            lines.append(settings.last_eval_blender_timing)
+        if getattr(settings, "last_eval_gpu_timing", ""):
+            lines.append(settings.last_eval_gpu_timing)
+        if not lines and settings.status:
+            lines.append(settings.status)
+
+        if not lines:
+            self.report({"WARNING"}, "No Pose Trainer timing has been recorded yet")
+            return {"CANCELLED"}
+
+        context.window_manager.clipboard = "\n".join(lines)
+        settings.status = "Copied Pose Trainer timing to clipboard"
+        self.report({"INFO"}, settings.status)
+        return {"FINISHED"}
+
+
 class PT_OT_toggle_live_update(bpy.types.Operator):
     bl_idname = "pose_trainer.toggle_live_update"
     bl_label = "Toggle Live Update"

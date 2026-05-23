@@ -1,4 +1,5 @@
 #include "pose_trainer_core.h"
+#include "opencl_backend.h"
 
 #include <Eigen/Dense>
 
@@ -7,6 +8,8 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_map>
+#include <utility>
 
 namespace pose_trainer {
 namespace {
@@ -21,6 +24,27 @@ using Eigen::MatrixXf;
 using Eigen::RowMajor;
 using Eigen::Vector3f;
 using Eigen::VectorXf;
+
+constexpr uint32_t kBoundaryHalfedge = std::numeric_limits<uint32_t>::max();
+constexpr uint32_t kMaxFaceVerts = 64;
+constexpr uint32_t kMaxRing = 128;
+
+struct EdgeKey {
+  uint32_t tail = 0;
+  uint32_t head = 0;
+
+  bool operator==(const EdgeKey& other) const {
+    return tail == other.tail && head == other.head;
+  }
+};
+
+struct EdgeKeyHash {
+  size_t operator()(const EdgeKey& key) const {
+    size_t hash = std::hash<uint32_t>{}(key.tail);
+    hash ^= std::hash<uint32_t>{}(key.head) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    return hash;
+  }
+};
 
 Vec3 operator+(Vec3 a, Vec3 b) {
   return {a.x + b.x, a.y + b.y, a.z + b.z};
@@ -119,23 +143,158 @@ std::vector<std::vector<uint32_t>> build_neighbors(
   return neighbors;
 }
 
+void build_halfedges(
+    uint32_t vertex_count,
+    const std::vector<std::vector<uint32_t>>& faces,
+    PoseTrainerCache& cache) {
+  uint32_t total_halfedges = 0;
+  for (const auto& face : faces) {
+    if (face.size() < 3) {
+      continue;
+    }
+    if (face.size() > kMaxFaceVerts) {
+      throw std::invalid_argument("faces with more than 64 vertices are not supported by the Mush3D half-edge relax shader");
+    }
+    total_halfedges += static_cast<uint32_t>(face.size());
+  }
+
+  cache.halfedge_twin.assign(total_halfedges, kBoundaryHalfedge);
+  cache.halfedge_next.assign(total_halfedges, kBoundaryHalfedge);
+  cache.halfedge_vertex.assign(total_halfedges, kBoundaryHalfedge);
+  cache.vertex_halfedge.assign(vertex_count, kBoundaryHalfedge);
+
+  std::vector<uint32_t> halfedge_tail(total_halfedges, kBoundaryHalfedge);
+  std::unordered_map<EdgeKey, uint32_t, EdgeKeyHash> edge_map;
+  edge_map.reserve(total_halfedges);
+
+  uint32_t he_index = 0;
+  for (const auto& face : faces) {
+    const uint32_t count = static_cast<uint32_t>(face.size());
+    if (count < 3) {
+      continue;
+    }
+
+    const uint32_t first_he = he_index;
+    for (uint32_t e = 0; e < count; ++e) {
+      const uint32_t tail = face[e];
+      const uint32_t head = face[(e + 1) % count];
+      if (tail >= vertex_count || head >= vertex_count) {
+        throw std::invalid_argument("face index out of range");
+      }
+
+      halfedge_tail[he_index] = tail;
+      cache.halfedge_vertex[he_index] = head;
+      cache.halfedge_next[he_index] = first_he + ((e + 1) % count);
+
+      const EdgeKey key{tail, head};
+      if (edge_map.find(key) == edge_map.end()) {
+        edge_map.emplace(key, he_index);
+      }
+
+      if (cache.vertex_halfedge[tail] == kBoundaryHalfedge) {
+        cache.vertex_halfedge[tail] = he_index;
+      }
+      he_index++;
+    }
+  }
+
+  for (const auto& item : edge_map) {
+    const EdgeKey reverse{item.first.head, item.first.tail};
+    const auto reverse_it = edge_map.find(reverse);
+    if (reverse_it != edge_map.end()) {
+      cache.halfedge_twin[item.second] = reverse_it->second;
+    }
+  }
+
+  for (uint32_t he = 0; he < total_halfedges; ++he) {
+    if (cache.halfedge_twin[he] == kBoundaryHalfedge) {
+      cache.vertex_halfedge[halfedge_tail[he]] = he;
+    }
+  }
+}
+
+uint32_t halfedge_prev_of(const std::vector<uint32_t>& halfedge_next, uint32_t he) {
+  uint32_t previous = he;
+  for (uint32_t i = 0; i < kMaxFaceVerts; ++i) {
+    const uint32_t next = halfedge_next[previous];
+    if (next == he) {
+      return previous;
+    }
+    previous = next;
+  }
+  return he;
+}
+
+template <typename AddNeighbor>
+void visit_mush3d_halfedge_ring(
+    const std::vector<uint32_t>& halfedge_twin,
+    const std::vector<uint32_t>& halfedge_next,
+    const std::vector<uint32_t>& halfedge_vertex,
+    const std::vector<uint32_t>& vertex_halfedge,
+    uint32_t vertex,
+    AddNeighbor&& add_neighbor) {
+  const uint32_t start_he = vertex_halfedge[vertex];
+  if (start_he == kBoundaryHalfedge) {
+    return;
+  }
+
+  const bool start_is_boundary = halfedge_twin[start_he] == kBoundaryHalfedge;
+  if (!start_is_boundary) {
+    uint32_t he = start_he;
+    for (uint32_t i = 0; i < kMaxRing; ++i) {
+      add_neighbor(halfedge_vertex[he]);
+      const uint32_t twin = halfedge_twin[he];
+      if (twin == kBoundaryHalfedge) {
+        break;
+      }
+      he = halfedge_next[twin];
+      if (he == start_he) {
+        break;
+      }
+    }
+    return;
+  }
+
+  add_neighbor(halfedge_vertex[start_he]);
+  uint32_t previous = halfedge_prev_of(halfedge_next, start_he);
+  for (uint32_t i = 0; i < kMaxRing; ++i) {
+    const uint32_t twin = halfedge_twin[previous];
+    if (twin == kBoundaryHalfedge) {
+      add_neighbor(halfedge_vertex[halfedge_prev_of(halfedge_next, previous)]);
+      break;
+    }
+    add_neighbor(halfedge_vertex[twin]);
+    previous = halfedge_prev_of(halfedge_next, twin);
+  }
+}
+
 std::vector<Vec3> relax(
     const std::vector<Vec3>& points,
-    const std::vector<std::vector<uint32_t>>& neighbors,
+    const std::vector<uint32_t>& halfedge_twin,
+    const std::vector<uint32_t>& halfedge_next,
+    const std::vector<uint32_t>& halfedge_vertex,
+    const std::vector<uint32_t>& vertex_halfedge,
     int iterations) {
   std::vector<Vec3> current = points;
   for (int iter = 0; iter < std::max(0, iterations); ++iter) {
     std::vector<Vec3> next = current;
     for (size_t v = 0; v < current.size(); ++v) {
-      const auto& ring = neighbors[v];
-      if (ring.empty()) {
+      Vec3 center;
+      uint32_t count = 0;
+      visit_mush3d_halfedge_ring(
+          halfedge_twin,
+          halfedge_next,
+          halfedge_vertex,
+          vertex_halfedge,
+          static_cast<uint32_t>(v),
+          [&](uint32_t neighbor) {
+            center += current[neighbor];
+            count++;
+          });
+      if (count == 0) {
         continue;
       }
-      Vec3 center;
-      for (uint32_t n : ring) {
-        center += current[n];
-      }
-      next[v] = center / static_cast<float>(ring.size());
+      next[v] = center / static_cast<float>(count);
     }
     current.swap(next);
   }
@@ -144,21 +303,31 @@ std::vector<Vec3> relax(
 
 std::vector<float> relax_weights(
     const std::vector<float>& weights,
-    const std::vector<std::vector<uint32_t>>& neighbors,
+    const std::vector<uint32_t>& halfedge_twin,
+    const std::vector<uint32_t>& halfedge_next,
+    const std::vector<uint32_t>& halfedge_vertex,
+    const std::vector<uint32_t>& vertex_halfedge,
     int iterations) {
   std::vector<float> current = weights;
   for (int iter = 0; iter < std::max(0, iterations); ++iter) {
     std::vector<float> next = current;
     for (size_t v = 0; v < current.size(); ++v) {
-      const auto& ring = neighbors[v];
-      if (ring.empty()) {
+      float total = 0.0f;
+      uint32_t count = 0;
+      visit_mush3d_halfedge_ring(
+          halfedge_twin,
+          halfedge_next,
+          halfedge_vertex,
+          vertex_halfedge,
+          static_cast<uint32_t>(v),
+          [&](uint32_t neighbor) {
+            total += current[neighbor];
+            count++;
+          });
+      if (count == 0) {
         continue;
       }
-      float total = current[v];
-      for (uint32_t n : ring) {
-        total += current[n];
-      }
-      next[v] = std::clamp(total / static_cast<float>(ring.size() + 1), 0.0f, 1.0f);
+      next[v] = total / static_cast<float>(count);
     }
     current.swap(next);
   }
@@ -280,6 +449,155 @@ std::array<uint32_t, kRepresentativeVertexCount> sample_reps(
   return reps;
 }
 
+void pack_neighbor_csr(PoseTrainerCache& cache) {
+  cache.neighbor_offsets.assign(cache.vertex_count + 1, 0);
+  for (uint32_t v = 0; v < cache.vertex_count; ++v) {
+    cache.neighbor_offsets[v + 1] = cache.neighbor_offsets[v] + static_cast<uint32_t>(cache.neighbors[v].size());
+  }
+  cache.neighbor_indices.resize(cache.neighbor_offsets.back());
+  for (uint32_t v = 0; v < cache.vertex_count; ++v) {
+    std::copy(
+        cache.neighbors[v].begin(),
+        cache.neighbors[v].end(),
+        cache.neighbor_indices.begin() + cache.neighbor_offsets[v]);
+  }
+}
+
+void pack_membership_csr(PoseTrainerCache& cache) {
+  cache.membership_offsets.assign(cache.vertex_count + 1, 0);
+  for (const AreaModel& area : cache.areas) {
+    for (uint32_t v : area.active_vertices) {
+      cache.membership_offsets[v + 1] += 1;
+    }
+  }
+  for (uint32_t v = 0; v < cache.vertex_count; ++v) {
+    cache.membership_offsets[v + 1] += cache.membership_offsets[v];
+  }
+
+  const uint32_t nnz = cache.membership_offsets.back();
+  cache.membership_area_ids.assign(nnz, 0);
+  cache.membership_weights.assign(nnz, 0.0f);
+  std::vector<uint32_t> cursor = cache.membership_offsets;
+  for (const AreaModel& area : cache.areas) {
+    for (size_t i = 0; i < area.active_vertices.size(); ++i) {
+      const uint32_t v = area.active_vertices[i];
+      const uint32_t dst = cursor[v]++;
+      cache.membership_area_ids[dst] = area.area_id;
+      cache.membership_weights[dst] = area.active_weights[i];
+    }
+  }
+}
+
+void pack_sample_deltas(PoseTrainerCache& cache) {
+  cache.sample_deltas_flat.assign(cache.sample_deltas.size() * cache.vertex_count * 3, 0.0f);
+  for (size_t s = 0; s < cache.sample_deltas.size(); ++s) {
+    for (uint32_t v = 0; v < cache.vertex_count; ++v) {
+      const size_t offset = (s * cache.vertex_count + v) * 3;
+      const Vec3 d = cache.sample_deltas[s][v];
+      cache.sample_deltas_flat[offset] = d.x;
+      cache.sample_deltas_flat[offset + 1] = d.y;
+      cache.sample_deltas_flat[offset + 2] = d.z;
+    }
+  }
+}
+
+void pack_opencl_area_data(PoseTrainerCache& cache, int sample_count) {
+  const size_t area_count = cache.areas.size();
+  const size_t shape_count = cache.sample_deltas.size();
+  cache.rep_indices_flat.assign(area_count * kRepresentativeVertexCount, 0);
+  cache.feature_values_flat.assign(area_count * sample_count * kRepresentativeVertexCount * 3, 0.0f);
+  cache.theta_values_flat.assign(area_count * sample_count * sample_count, 0.0f);
+  cache.scale_values.assign(area_count, 1.0f);
+  cache.layer_rep_bases_flat.assign(area_count * shape_count * kRepresentativeVertexCount * 3, 0.0f);
+
+  for (const AreaModel& area : cache.areas) {
+    const size_t area_id = area.area_id;
+    cache.scale_values[area_id] = area.scale;
+    for (int r = 0; r < kRepresentativeVertexCount; ++r) {
+      const uint32_t rep = area.reps[r];
+      cache.rep_indices_flat[area_id * kRepresentativeVertexCount + r] = rep;
+      for (size_t s = 0; s < shape_count; ++s) {
+        const Vec3 p = cache.sample_relaxed[s][rep];
+        const size_t base = ((area_id * shape_count + s) * kRepresentativeVertexCount + r) * 3;
+        cache.layer_rep_bases_flat[base] = p.x;
+        cache.layer_rep_bases_flat[base + 1] = p.y;
+        cache.layer_rep_bases_flat[base + 2] = p.z;
+      }
+    }
+
+    for (int s = 0; s < sample_count; ++s) {
+      for (int r = 0; r < kRepresentativeVertexCount; ++r) {
+        const Vec3 p = area.features[s * kRepresentativeVertexCount + r];
+        const size_t base = ((area_id * sample_count + s) * kRepresentativeVertexCount + r) * 3;
+        cache.feature_values_flat[base] = p.x;
+        cache.feature_values_flat[base + 1] = p.y;
+        cache.feature_values_flat[base + 2] = p.z;
+      }
+    }
+
+    for (int row = 0; row < sample_count; ++row) {
+      for (int col = 0; col < sample_count; ++col) {
+        cache.theta_values_flat[(area_id * sample_count + row) * sample_count + col] =
+            area.theta[row * sample_count + col];
+      }
+    }
+  }
+}
+
+std::vector<float> evaluate_area_activations(
+    const PoseTrainerCache& cache,
+    const std::vector<Vec3>& relaxed,
+    std::vector<float>& rotations_out) {
+  const int sample_count = static_cast<int>(cache.sample_deltas.size()) + 1;
+  const int shape_count = static_cast<int>(cache.sample_deltas.size());
+  std::vector<float> activations(cache.areas.size() * sample_count, 0.0f);
+  rotations_out.assign(cache.areas.size() * shape_count * 9, 0.0f);
+
+  for (const AreaModel& area : cache.areas) {
+    const auto current_feature = gather_reps(relaxed, area.reps);
+    const auto bind_feature = gather_reps(cache.bind_relaxed, area.reps);
+    auto aligned_current = align_points(current_feature, bind_feature);
+    for (Vec3& p : aligned_current) {
+      p = p * area.scale;
+    }
+
+    std::vector<float> phi(sample_count, 0.0f);
+    for (int s = 0; s < sample_count; ++s) {
+      float total = 0.0f;
+      for (int r = 0; r < kRepresentativeVertexCount; ++r) {
+        total += basis(length(aligned_current[r] - area.features[s * kRepresentativeVertexCount + r]), cache.settings.rbf_radius);
+      }
+      phi[s] = total / static_cast<float>(kRepresentativeVertexCount);
+    }
+
+    Eigen::Map<const Matrix<float, Dynamic, Dynamic, RowMajor>> theta_matrix(
+        area.theta.data(), sample_count, sample_count);
+    Eigen::Map<const VectorXf> phi_vector(phi.data(), sample_count);
+    const VectorXf raw_vector = theta_matrix * phi_vector;
+    std::vector<float> raw(sample_count, 0.0f);
+    for (int i = 0; i < sample_count; ++i) {
+      raw[i] = raw_vector(i);
+    }
+    const std::vector<float> activation = project_simplex(raw);
+    std::copy(
+        activation.begin(),
+        activation.end(),
+        activations.begin() + static_cast<size_t>(area.area_id) * sample_count);
+
+    for (size_t s = 0; s < cache.sample_deltas.size(); ++s) {
+      const auto sample_feature = gather_reps(cache.sample_relaxed[s], area.reps);
+      const Matrix3f r = procrustes_rotation(sample_feature, current_feature);
+      const size_t base = (static_cast<size_t>(area.area_id) * shape_count + s) * 9;
+      for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+          rotations_out[base + row * 3 + col] = r(row, col);
+        }
+      }
+    }
+  }
+  return activations;
+}
+
 }  // namespace
 
 std::vector<float> project_simplex(const std::vector<float>& weights) {
@@ -332,10 +650,24 @@ PoseTrainerCache train(
   cache.settings = settings;
   cache.faces = faces;
   cache.neighbors = build_neighbors(cache.vertex_count, faces);
-  cache.bind_relaxed = relax(bind, cache.neighbors, settings.relax_iterations);
+  pack_neighbor_csr(cache);
+  build_halfedges(cache.vertex_count, faces, cache);
+  cache.bind_relaxed = relax(
+      bind,
+      cache.halfedge_twin,
+      cache.halfedge_next,
+      cache.halfedge_vertex,
+      cache.vertex_halfedge,
+      settings.relax_iterations);
 
   for (const auto& sample : samples) {
-    std::vector<Vec3> relaxed = relax(sample, cache.neighbors, settings.relax_iterations);
+    std::vector<Vec3> relaxed = relax(
+        sample,
+        cache.halfedge_twin,
+        cache.halfedge_next,
+        cache.halfedge_vertex,
+        cache.vertex_halfedge,
+        settings.relax_iterations);
     std::vector<Vec3> delta(sample.size());
     for (size_t i = 0; i < sample.size(); ++i) {
       delta[i] = sample[i] - relaxed[i];
@@ -353,8 +685,21 @@ PoseTrainerCache train(
     AreaModel model;
     model.name = input.name;
     model.area_id = static_cast<uint32_t>(area_index);
-    model.vertex_weights = relax_weights(input.weights, cache.neighbors, settings.area_relax_iterations);
+    model.vertex_weights = relax_weights(
+        input.weights,
+        cache.halfedge_twin,
+        cache.halfedge_next,
+        cache.halfedge_vertex,
+        cache.vertex_halfedge,
+        settings.area_relax_iterations);
     model.reps = sample_reps(cache.bind_relaxed, model.vertex_weights);
+    for (uint32_t v = 0; v < model.vertex_weights.size(); ++v) {
+      const float w = model.vertex_weights[v];
+      if (w > 0.0f) {
+        model.active_vertices.push_back(v);
+        model.active_weights.push_back(w);
+      }
+    }
 
     const auto bind_feature = gather_reps(cache.bind_relaxed, model.reps);
     model.features.resize(sample_count * kRepresentativeVertexCount);
@@ -384,6 +729,16 @@ PoseTrainerCache train(
     cache.areas.push_back(std::move(model));
   }
 
+  cache.total_area_weights.assign(cache.vertex_count, 0.0f);
+  for (const AreaModel& area : cache.areas) {
+    for (size_t i = 0; i < area.active_vertices.size(); ++i) {
+      cache.total_area_weights[area.active_vertices[i]] += area.active_weights[i];
+    }
+  }
+  pack_membership_csr(cache);
+  pack_sample_deltas(cache);
+  pack_opencl_area_data(cache, sample_count);
+
   return cache;
 }
 
@@ -391,7 +746,9 @@ std::vector<Vec3> PoseTrainerCache::evaluate(
     const std::vector<Vec3>& animated,
     const std::vector<float>& vertex_mask,
     float envelope,
-    int solve_iterations_override) const {
+    int solve_iterations_override,
+    int runtime_backend_override,
+    bool profile_timing) const {
   if (animated.size() != vertex_count) {
     throw std::invalid_argument("animated vertex count does not match cache");
   }
@@ -399,69 +756,64 @@ std::vector<Vec3> PoseTrainerCache::evaluate(
     throw std::invalid_argument("vertex mask length does not match cache");
   }
 
-  std::vector<Vec3> current = animated;
+  const int backend = runtime_backend_override >= 0 ? runtime_backend_override : settings.runtime_backend;
   const int iterations = std::max(1, solve_iterations_override > 0 ? solve_iterations_override : settings.solve_iterations);
+  if (backend != 1) {
+    try {
+      std::vector<Vec3> out = evaluate_opencl(*this, animated, vertex_mask, envelope, iterations, profile_timing);
+      last_backend = "OpenCL";
+      return out;
+    } catch (const std::exception&) {
+      if (backend == 2) {
+        throw;
+      }
+    }
+  }
+  last_backend = "CPU";
+  last_opencl_timing.clear();
+
+  std::vector<Vec3> current = animated;
   const int sample_count = static_cast<int>(sample_deltas.size()) + 1;
 
   for (int iter = 0; iter < iterations; ++iter) {
-    const std::vector<Vec3> relaxed = relax(current, neighbors, settings.relax_iterations);
+    const std::vector<Vec3> relaxed = relax(
+        current,
+        halfedge_twin,
+        halfedge_next,
+        halfedge_vertex,
+        vertex_halfedge,
+        settings.relax_iterations);
     std::vector<Vec3> pose_delta(vertex_count);
     for (uint32_t v = 0; v < vertex_count; ++v) {
       pose_delta[v] = animated[v] - relaxed[v];
     }
 
     std::vector<Vec3> accum(vertex_count);
-    std::vector<float> total_area_weight(vertex_count, 0.0f);
+    std::vector<float> rotations;
+    const std::vector<float> activation_flat = evaluate_area_activations(*this, relaxed, rotations);
 
     for (const AreaModel& area : areas) {
-      const auto current_feature = gather_reps(relaxed, area.reps);
-      const auto bind_feature = gather_reps(bind_relaxed, area.reps);
-      auto aligned_current = align_points(current_feature, bind_feature);
-      for (Vec3& p : aligned_current) {
-        p = p * area.scale;
-      }
-
-      std::vector<float> phi(sample_count, 0.0f);
-      for (int s = 0; s < sample_count; ++s) {
-        float total = 0.0f;
-        for (int r = 0; r < kRepresentativeVertexCount; ++r) {
-          total += basis(length(aligned_current[r] - area.features[s * kRepresentativeVertexCount + r]), settings.rbf_radius);
-        }
-        phi[s] = total / static_cast<float>(kRepresentativeVertexCount);
-      }
-
-      Eigen::Map<const Matrix<float, Dynamic, Dynamic, RowMajor>> theta_matrix(
-          area.theta.data(), sample_count, sample_count);
-      Eigen::Map<const VectorXf> phi_vector(phi.data(), sample_count);
-      const VectorXf raw_vector = theta_matrix * phi_vector;
-      std::vector<float> raw(sample_count, 0.0f);
-      for (int i = 0; i < sample_count; ++i) {
-        raw[i] = raw_vector(i);
-      }
-      const std::vector<float> activation = project_simplex(raw);
-
-      std::vector<Matrix3f> rotations(sample_deltas.size());
-      for (size_t s = 0; s < sample_deltas.size(); ++s) {
-        const auto sample_feature = gather_reps(sample_relaxed[s], area.reps);
-        rotations[s] = procrustes_rotation(sample_feature, current_feature);
-      }
-
-      for (uint32_t v = 0; v < vertex_count; ++v) {
-        const float area_w = area.vertex_weights[v];
-        if (area_w <= 0.0f) {
-          continue;
-        }
-        total_area_weight[v] += area_w;
-        accum[v] += pose_delta[v] * (area_w * activation[0]);
+      for (size_t i = 0; i < area.active_vertices.size(); ++i) {
+        const uint32_t v = area.active_vertices[i];
+        const float area_w = area.active_weights[i];
+        const size_t activation_base = static_cast<size_t>(area.area_id) * sample_count;
+        accum[v] += pose_delta[v] * (area_w * activation_flat[activation_base]);
         for (size_t s = 0; s < sample_deltas.size(); ++s) {
-          accum[v] += mul(rotations[s], sample_deltas[s][v]) * (area_w * activation[s + 1]);
+          const size_t rot_base = (static_cast<size_t>(area.area_id) * sample_deltas.size() + s) * 9;
+          Matrix3f rotation;
+          for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+              rotation(row, col) = rotations[rot_base + row * 3 + col];
+            }
+          }
+          accum[v] += mul(rotation, sample_deltas[s][v]) * (area_w * activation_flat[activation_base + s + 1]);
         }
       }
     }
 
     std::vector<Vec3> output(vertex_count);
     for (uint32_t v = 0; v < vertex_count; ++v) {
-      const float uncovered = std::max(1.0f - total_area_weight[v], 0.0f);
+      const float uncovered = std::max(1.0f - total_area_weights[v], 0.0f);
       accum[v] += pose_delta[v] * uncovered;
       const Vec3 corrected = relaxed[v] + accum[v];
       const float mask = vertex_mask.empty() ? 1.0f : vertex_mask[v];
@@ -472,6 +824,14 @@ std::vector<Vec3> PoseTrainerCache::evaluate(
   }
 
   return current;
+}
+
+bool opencl_is_available() {
+  return opencl_runtime_available();
+}
+
+std::string opencl_status() {
+  return opencl_runtime_status();
 }
 
 }  // namespace pose_trainer

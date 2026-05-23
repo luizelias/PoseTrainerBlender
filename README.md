@@ -24,6 +24,14 @@ The `REFERENCE` directory is the algorithm reference and should remain read-only
   `View3D > Sidebar > Pose Trainer`.
 - Output-object workflow: the source object is not mutated during evaluation.
 - C++/Eigen training and evaluation through the compiled Python extension.
+- Optional OpenCL runtime backend for live evaluation. The current OpenCL path
+  accelerates Mush3D-style half-edge mesh relaxation, per-area RBF/Procrustes
+  evaluation, and final per-vertex delta application, then reads final positions
+  back for Blender.
+  Its command queue avoids intermediate hard waits between kernels, reuses the
+  mask buffer when possible, and reports `GPU wall` plus
+  upload/relax/area/apply/read execution buckets through the add-on's
+  `Profile Timing` display.
 - UV shell extraction for area masks: use `Areas From UV Shells` on a source
   mesh with an active UV map to create `PT_UVShell_###` vertex groups and add
   them as Pose Trainer deformation areas.

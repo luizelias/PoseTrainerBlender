@@ -19,6 +19,8 @@ class PoseTrainerSettings:
 
 class PoseTrainerCache:
     vertex_count = 0
+    last_backend = "Unavailable"
+    last_opencl_timing = ""
 
     def evaluate(self, *_args, **_kwargs):
         raise RuntimeError(_ERROR)
@@ -30,3 +32,11 @@ def train(*_args, **_kwargs) -> PoseTrainerCache:
 
 def project_simplex(*_args, **_kwargs):
     raise RuntimeError(_ERROR)
+
+
+def opencl_available() -> bool:
+    return False
+
+
+def opencl_status() -> str:
+    return _ERROR

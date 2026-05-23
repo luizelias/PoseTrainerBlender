@@ -115,12 +115,16 @@ py::array_t<float> evaluate_py(
     py::array_t<float, py::array::c_style | py::array::forcecast> animated,
     py::object vertex_mask,
     float envelope,
-    int solve_iterations) {
+    int solve_iterations,
+    int runtime_backend,
+    bool profile_timing) {
   return vec3_to_array(cache.evaluate(
       array_to_vec3(animated, "animated"),
       parse_mask(vertex_mask),
       envelope,
-      solve_iterations));
+      solve_iterations,
+      runtime_backend,
+      profile_timing));
 }
 
 }  // namespace
@@ -133,16 +137,21 @@ PYBIND11_MODULE(_pose_trainer_core, m) {
       .def_readwrite("relax_iterations", &PoseTrainerSettings::relax_iterations)
       .def_readwrite("area_relax_iterations", &PoseTrainerSettings::area_relax_iterations)
       .def_readwrite("solve_iterations", &PoseTrainerSettings::solve_iterations)
+      .def_readwrite("runtime_backend", &PoseTrainerSettings::runtime_backend)
       .def_readwrite("rbf_radius", &PoseTrainerSettings::rbf_radius)
       .def_readwrite("regularization", &PoseTrainerSettings::regularization);
 
   py::class_<PoseTrainerCache>(m, "PoseTrainerCache")
       .def_property_readonly("vertex_count", [](const PoseTrainerCache& cache) { return cache.vertex_count; })
+      .def_property_readonly("last_backend", [](const PoseTrainerCache& cache) { return cache.last_backend; })
+      .def_property_readonly("last_opencl_timing", [](const PoseTrainerCache& cache) { return cache.last_opencl_timing; })
       .def("evaluate", &evaluate_py,
            py::arg("animated"),
            py::arg("vertex_mask") = py::none(),
            py::arg("envelope") = 1.0f,
-           py::arg("solve_iterations") = 0);
+           py::arg("solve_iterations") = 0,
+           py::arg("runtime_backend") = -1,
+           py::arg("profile_timing") = false);
 
   m.def("train", &train_py,
         py::arg("faces"),
@@ -152,4 +161,6 @@ PYBIND11_MODULE(_pose_trainer_core, m) {
         py::arg("settings") = PoseTrainerSettings{});
 
   m.def("project_simplex", &project_simplex, py::arg("weights"));
+  m.def("opencl_available", &opencl_is_available);
+  m.def("opencl_status", &opencl_status);
 }
