@@ -176,9 +176,9 @@ def train_scene(context: bpy.types.Context) -> None:
     settings.trained = True
     total_ms = _elapsed_ms(total_start)
     settings.last_train_timing = (
-        f"Train {total_ms:.1f} ms | read {read_ms:.1f}, areas {area_ms:.1f}, C++ {core_ms:.1f}"
+        f"Train {total_ms:.1f} ms | read {read_ms:.1f}, areas {area_ms:.1f}, core {core_ms:.1f}"
     )
-    settings.status = f"Trained {len(samples)} sample(s), {len(areas)} area(s) with Eigen C++ core"
+    settings.status = f"Trained {len(samples)} sample(s), {len(areas)} area(s) with Pose Trainer core"
     _ensure_output(settings, source_snapshot)
 
 

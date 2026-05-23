@@ -416,6 +416,59 @@ std::vector<float> train_theta(const std::vector<Vec3>& features, int sample_cou
   return theta_values;
 }
 
+void train_area_model_cpu(PoseTrainerCache& cache, AreaModel& model, int sample_count) {
+  const auto bind_feature = gather_reps(cache.bind_relaxed, model.reps);
+  model.features.resize(sample_count * kRepresentativeVertexCount);
+  for (int r = 0; r < kRepresentativeVertexCount; ++r) {
+    model.features[r] = bind_feature[r];
+  }
+  for (size_t s = 0; s < cache.sample_relaxed.size(); ++s) {
+    const auto feature = gather_reps(cache.sample_relaxed[s], model.reps);
+    const auto aligned = align_points(feature, bind_feature);
+    for (int r = 0; r < kRepresentativeVertexCount; ++r) {
+      model.features[(s + 1) * kRepresentativeVertexCount + r] = aligned[r];
+    }
+  }
+
+  Vec3 min_p = bind_feature[0];
+  Vec3 max_p = bind_feature[0];
+  for (Vec3 p : bind_feature) {
+    min_p.x = std::min(min_p.x, p.x); min_p.y = std::min(min_p.y, p.y); min_p.z = std::min(min_p.z, p.z);
+    max_p.x = std::max(max_p.x, p.x); max_p.y = std::max(max_p.y, p.y); max_p.z = std::max(max_p.z, p.z);
+  }
+  const float diagonal = length(max_p - min_p);
+  model.scale = diagonal > 1.0e-5f ? 1.0f / diagonal : 1.0f;
+  for (Vec3& feature : model.features) {
+    feature = feature * model.scale;
+  }
+  model.theta = train_theta(model.features, sample_count, cache.settings.rbf_radius, cache.settings.regularization);
+}
+
+std::vector<float> build_opencl_train_rep_positions(const PoseTrainerCache& cache, int sample_count) {
+  std::vector<float> rep_positions(
+      cache.areas.size() * sample_count * kRepresentativeVertexCount * 3,
+      0.0f);
+  for (const AreaModel& area : cache.areas) {
+    const size_t area_id = area.area_id;
+    for (int r = 0; r < kRepresentativeVertexCount; ++r) {
+      const uint32_t rep = area.reps[r];
+      const Vec3 bind_p = cache.bind_relaxed[rep];
+      size_t base = ((area_id * sample_count) * kRepresentativeVertexCount + r) * 3;
+      rep_positions[base] = bind_p.x;
+      rep_positions[base + 1] = bind_p.y;
+      rep_positions[base + 2] = bind_p.z;
+      for (size_t s = 0; s < cache.sample_relaxed.size(); ++s) {
+        const Vec3 sample_p = cache.sample_relaxed[s][rep];
+        base = ((area_id * sample_count + s + 1) * kRepresentativeVertexCount + r) * 3;
+        rep_positions[base] = sample_p.x;
+        rep_positions[base + 1] = sample_p.y;
+        rep_positions[base + 2] = sample_p.z;
+      }
+    }
+  }
+  return rep_positions;
+}
+
 std::array<uint32_t, kRepresentativeVertexCount> sample_reps(
     const std::vector<Vec3>& bind_relaxed,
     const std::vector<float>& weights) {
@@ -652,28 +705,59 @@ PoseTrainerCache train(
   cache.neighbors = build_neighbors(cache.vertex_count, faces);
   pack_neighbor_csr(cache);
   build_halfedges(cache.vertex_count, faces, cache);
-  cache.bind_relaxed = relax(
-      bind,
-      cache.halfedge_twin,
-      cache.halfedge_next,
-      cache.halfedge_vertex,
-      cache.vertex_halfedge,
-      settings.relax_iterations);
 
-  for (const auto& sample : samples) {
-    std::vector<Vec3> relaxed = relax(
-        sample,
+  // OpenCL training is still experimental; keep Auto on the proven CPU path
+  // while explicit OpenCL remains available for parity and profiling.
+  const bool try_opencl_training = settings.runtime_backend == 2;
+  const bool require_opencl_training = settings.runtime_backend == 2;
+  bool relaxed_with_opencl = false;
+  if (try_opencl_training) {
+    try {
+      cache.bind_relaxed = relax_opencl(cache, bind, settings.relax_iterations);
+      for (const auto& sample : samples) {
+        std::vector<Vec3> relaxed = relax_opencl(cache, sample, settings.relax_iterations);
+        std::vector<Vec3> delta(sample.size());
+        for (size_t i = 0; i < sample.size(); ++i) {
+          delta[i] = sample[i] - relaxed[i];
+        }
+        cache.sample_relaxed.push_back(std::move(relaxed));
+        cache.sample_deltas.push_back(std::move(delta));
+      }
+      relaxed_with_opencl = true;
+    } catch (const std::exception&) {
+      if (require_opencl_training) {
+        throw;
+      }
+      cache.bind_relaxed.clear();
+      cache.sample_relaxed.clear();
+      cache.sample_deltas.clear();
+    }
+  }
+
+  if (!relaxed_with_opencl) {
+    cache.bind_relaxed = relax(
+        bind,
         cache.halfedge_twin,
         cache.halfedge_next,
         cache.halfedge_vertex,
         cache.vertex_halfedge,
         settings.relax_iterations);
-    std::vector<Vec3> delta(sample.size());
-    for (size_t i = 0; i < sample.size(); ++i) {
-      delta[i] = sample[i] - relaxed[i];
+
+    for (const auto& sample : samples) {
+      std::vector<Vec3> relaxed = relax(
+          sample,
+          cache.halfedge_twin,
+          cache.halfedge_next,
+          cache.halfedge_vertex,
+          cache.vertex_halfedge,
+          settings.relax_iterations);
+      std::vector<Vec3> delta(sample.size());
+      for (size_t i = 0; i < sample.size(); ++i) {
+        delta[i] = sample[i] - relaxed[i];
+      }
+      cache.sample_relaxed.push_back(std::move(relaxed));
+      cache.sample_deltas.push_back(std::move(delta));
     }
-    cache.sample_relaxed.push_back(std::move(relaxed));
-    cache.sample_deltas.push_back(std::move(delta));
   }
 
   const int sample_count = static_cast<int>(samples.size()) + 1;
@@ -700,33 +784,26 @@ PoseTrainerCache train(
         model.active_weights.push_back(w);
       }
     }
+    cache.areas.push_back(std::move(model));
+  }
 
-    const auto bind_feature = gather_reps(cache.bind_relaxed, model.reps);
-    model.features.resize(sample_count * kRepresentativeVertexCount);
-    for (int r = 0; r < kRepresentativeVertexCount; ++r) {
-      model.features[r] = bind_feature[r];
-    }
-    for (size_t s = 0; s < cache.sample_relaxed.size(); ++s) {
-      const auto feature = gather_reps(cache.sample_relaxed[s], model.reps);
-      const auto aligned = align_points(feature, bind_feature);
-      for (int r = 0; r < kRepresentativeVertexCount; ++r) {
-        model.features[(s + 1) * kRepresentativeVertexCount + r] = aligned[r];
+  bool trained_areas_with_opencl = false;
+  if (try_opencl_training && !cache.areas.empty()) {
+    try {
+      const std::vector<float> rep_positions = build_opencl_train_rep_positions(cache, sample_count);
+      train_area_models_opencl(cache, rep_positions, sample_count);
+      trained_areas_with_opencl = true;
+    } catch (const std::exception&) {
+      if (require_opencl_training) {
+        throw;
       }
     }
+  }
 
-    Vec3 min_p = bind_feature[0];
-    Vec3 max_p = bind_feature[0];
-    for (Vec3 p : bind_feature) {
-      min_p.x = std::min(min_p.x, p.x); min_p.y = std::min(min_p.y, p.y); min_p.z = std::min(min_p.z, p.z);
-      max_p.x = std::max(max_p.x, p.x); max_p.y = std::max(max_p.y, p.y); max_p.z = std::max(max_p.z, p.z);
+  if (!trained_areas_with_opencl) {
+    for (AreaModel& area : cache.areas) {
+      train_area_model_cpu(cache, area, sample_count);
     }
-    const float diagonal = length(max_p - min_p);
-    model.scale = diagonal > 1.0e-5f ? 1.0f / diagonal : 1.0f;
-    for (Vec3& feature : model.features) {
-      feature = feature * model.scale;
-    }
-    model.theta = train_theta(model.features, sample_count, settings.rbf_radius, settings.regularization);
-    cache.areas.push_back(std::move(model));
   }
 
   cache.total_area_weights.assign(cache.vertex_count, 0.0f);

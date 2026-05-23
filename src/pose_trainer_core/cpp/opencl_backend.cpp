@@ -201,8 +201,8 @@ uint64_t hash_float_vector(const std::vector<float>& values) {
   return hash;
 }
 
-const char* kernel_source() {
-  return R"CLC(
+std::string kernel_source() {
+  return std::string(R"CLC(
 __kernel void relax_neighbors(
     __global const float* in_pos,
     __global float* out_pos,
@@ -505,6 +505,180 @@ void project_simplex_private(__private float* w, uint n) {
   const float tau = (cumulative - 1.0f) / (float)(rho + 1u);
   for (uint i = 0u; i < n; i++) {
     w[i] = fmax(w[i] - tau, 0.0f);
+  }
+}
+)CLC") + R"CLC(
+
+float3 read_train_rep(__global const float* rep_positions, uint area, uint sample, uint rep, uint sample_count) {
+  const uint base = ((area * sample_count + sample) * 16u + rep) * 3u;
+  return (float3)(rep_positions[base], rep_positions[base + 1u], rep_positions[base + 2u]);
+}
+
+void write_train_feature(__global float* features, uint area, uint sample, uint rep, uint sample_count, float3 p) {
+  const uint base = ((area * sample_count + sample) * 16u + rep) * 3u;
+  features[base] = p.x;
+  features[base + 1u] = p.y;
+  features[base + 2u] = p.z;
+}
+
+float3 read_train_feature(__global const float* features, uint area, uint sample, uint rep, uint sample_count) {
+  const uint base = ((area * sample_count + sample) * 16u + rep) * 3u;
+  return (float3)(features[base], features[base + 1u], features[base + 2u]);
+}
+
+void gauss_jordan_inverse_private(
+    __private float* mat,
+    __private float* inv,
+    uint n) {
+  const uint stride = 12u;
+  for (uint i = 0u; i < n; i++) {
+    for (uint j = 0u; j < n; j++) {
+      inv[i * stride + j] = i == j ? 1.0f : 0.0f;
+    }
+  }
+
+  for (uint col = 0u; col < n; col++) {
+    float max_val = fabs(mat[col * stride + col]);
+    uint max_row = col;
+    for (uint row = col + 1u; row < n; row++) {
+      const float v = fabs(mat[row * stride + col]);
+      if (v > max_val) {
+        max_val = v;
+        max_row = row;
+      }
+    }
+
+    if (max_row != col) {
+      for (uint j = 0u; j < n; j++) {
+        const float tmp = mat[col * stride + j];
+        mat[col * stride + j] = mat[max_row * stride + j];
+        mat[max_row * stride + j] = tmp;
+        const float tmp_inv = inv[col * stride + j];
+        inv[col * stride + j] = inv[max_row * stride + j];
+        inv[max_row * stride + j] = tmp_inv;
+      }
+    }
+
+    const float pivot = mat[col * stride + col];
+    if (fabs(pivot) < 1.0e-12f) {
+      continue;
+    }
+    const float inv_pivot = 1.0f / pivot;
+    for (uint j = 0u; j < n; j++) {
+      mat[col * stride + j] *= inv_pivot;
+      inv[col * stride + j] *= inv_pivot;
+    }
+
+    for (uint row = 0u; row < n; row++) {
+      if (row == col) {
+        continue;
+      }
+      const float factor = mat[row * stride + col];
+      if (fabs(factor) < 1.0e-15f) {
+        continue;
+      }
+      for (uint j = 0u; j < n; j++) {
+        mat[row * stride + j] -= factor * mat[col * stride + j];
+        inv[row * stride + j] -= factor * inv[col * stride + j];
+      }
+    }
+  }
+}
+
+__kernel void train_areas(
+    __global const float* rep_positions,
+    __global float* feature_out,
+    __global float* theta_out,
+    __global float* scale_out,
+    const uint area_count,
+    const uint sample_count,
+    const float rbf_radius,
+    const float regularization) {
+  const uint area = get_global_id(0);
+  if (area >= area_count || sample_count > 12u) { return; }
+
+  float3 bind_pts[16];
+  for (uint r = 0u; r < 16u; r++) {
+    bind_pts[r] = read_train_rep(rep_positions, area, 0u, r, sample_count);
+    write_train_feature(feature_out, area, 0u, r, sample_count, bind_pts[r]);
+  }
+
+  for (uint s = 1u; s < sample_count; s++) {
+    float3 sample_pts[16];
+    for (uint r = 0u; r < 16u; r++) {
+      sample_pts[r] = read_train_rep(rep_positions, area, s, r, sample_count);
+    }
+
+    float R[9];
+    procrustes_rotation16(sample_pts, bind_pts, R);
+    float3 sample_centroid = (float3)(0.0f, 0.0f, 0.0f);
+    float3 bind_centroid = (float3)(0.0f, 0.0f, 0.0f);
+    for (uint r = 0u; r < 16u; r++) {
+      sample_centroid += sample_pts[r];
+      bind_centroid += bind_pts[r];
+    }
+    sample_centroid *= 1.0f / 16.0f;
+    bind_centroid *= 1.0f / 16.0f;
+
+    for (uint r = 0u; r < 16u; r++) {
+      const float3 aligned = rotate3(R, sample_pts[r] - sample_centroid) + bind_centroid;
+      write_train_feature(feature_out, area, s, r, sample_count, aligned);
+    }
+  }
+
+  float3 min_p = bind_pts[0];
+  float3 max_p = bind_pts[0];
+  for (uint r = 1u; r < 16u; r++) {
+    min_p = fmin(min_p, bind_pts[r]);
+    max_p = fmax(max_p, bind_pts[r]);
+  }
+  const float diagonal = distance(min_p, max_p);
+  const float scale = diagonal > 1.0e-5f ? 1.0f / diagonal : 1.0f;
+  scale_out[area] = scale;
+
+  for (uint s = 0u; s < sample_count; s++) {
+    for (uint r = 0u; r < 16u; r++) {
+      const float3 p = read_train_feature(feature_out, area, s, r, sample_count) * scale;
+      write_train_feature(feature_out, area, s, r, sample_count, p);
+    }
+  }
+
+  float phi[12 * 12];
+  for (uint i = 0u; i < sample_count; i++) {
+    for (uint j = 0u; j < sample_count; j++) {
+      float total = 0.0f;
+      for (uint r = 0u; r < 16u; r++) {
+        const float d = distance(
+            read_train_feature(feature_out, area, i, r, sample_count),
+            read_train_feature(feature_out, area, j, r, sample_count));
+        total += 1.0f / sqrt(d * d + rbf_radius * rbf_radius);
+      }
+      phi[i * 12u + j] = total / 16.0f;
+    }
+  }
+
+  float a[12 * 12];
+  for (uint i = 0u; i < sample_count; i++) {
+    for (uint j = 0u; j < sample_count; j++) {
+      float sum = 0.0f;
+      for (uint k = 0u; k < sample_count; k++) {
+        sum += phi[k * 12u + i] * phi[k * 12u + j];
+      }
+      a[i * 12u + j] = sum + (i == j ? regularization : 0.0f);
+    }
+  }
+
+  float a_inv[12 * 12];
+  gauss_jordan_inverse_private(a, a_inv, sample_count);
+
+  for (uint i = 0u; i < sample_count; i++) {
+    for (uint j = 0u; j < sample_count; j++) {
+      float sum = 0.0f;
+      for (uint k = 0u; k < sample_count; k++) {
+        sum += phi[i * 12u + k] * a_inv[k * 12u + j];
+      }
+      theta_out[(area * sample_count + i) * sample_count + j] = sum;
+    }
   }
 }
 
@@ -826,6 +1000,7 @@ struct OpenClRuntime {
   cl_command_queue queue = nullptr;
   cl_program program = nullptr;
   cl_kernel relax_kernel = nullptr;
+  cl_kernel train_kernel = nullptr;
   cl_kernel evaluate_kernel = nullptr;
   cl_kernel apply_kernel = nullptr;
 
@@ -907,9 +1082,10 @@ struct OpenClRuntime {
       check(err, "clCreateCommandQueue");
     }
 
-    const char* source = kernel_source();
-    const size_t source_len = std::strlen(source);
-    program = cl.clCreateProgramWithSource(context, 1, &source, &source_len, &err);
+    const std::string source = kernel_source();
+    const char* source_ptr = source.c_str();
+    const size_t source_len = source.size();
+    program = cl.clCreateProgramWithSource(context, 1, &source_ptr, &source_len, &err);
     check(err, "clCreateProgramWithSource");
     err = cl.clBuildProgram(program, 1, &device, "", nullptr, nullptr);
     if (err != CL_SUCCESS) {
@@ -924,6 +1100,8 @@ struct OpenClRuntime {
 
     relax_kernel = cl.clCreateKernel(program, "relax_neighbors", &err);
     check(err, "clCreateKernel(relax_neighbors)");
+    train_kernel = cl.clCreateKernel(program, "train_areas", &err);
+    check(err, "clCreateKernel(train_areas)");
     evaluate_kernel = cl.clCreateKernel(program, "evaluate_areas", &err);
     check(err, "clCreateKernel(evaluate_areas)");
     apply_kernel = cl.clCreateKernel(program, "apply_pose_trainer", &err);
@@ -952,6 +1130,7 @@ struct OpenClRuntime {
     release(activations);
     release(rotations);
     if (relax_kernel) cl.clReleaseKernel(relax_kernel);
+    if (train_kernel) cl.clReleaseKernel(train_kernel);
     if (evaluate_kernel) cl.clReleaseKernel(evaluate_kernel);
     if (apply_kernel) cl.clReleaseKernel(apply_kernel);
     release_profile_events();
@@ -1086,7 +1265,15 @@ struct OpenClRuntime {
   }
 
   void ensure_static_buffers(const PoseTrainerCache& cache) {
-    const size_t key = reinterpret_cast<size_t>(&cache) ^ cache.vertex_count ^ (cache.areas.size() << 16);
+    const size_t key =
+        reinterpret_cast<size_t>(&cache) ^
+        static_cast<size_t>(cache.vertex_count) ^
+        (cache.areas.size() << 16) ^
+        (cache.sample_deltas_flat.size() << 1) ^
+        (cache.rep_indices_flat.size() << 3) ^
+        (cache.theta_values_flat.size() << 5) ^
+        (cache.feature_values_flat.size() << 7) ^
+        (cache.layer_rep_bases_flat.size() << 9);
     if (static_key == key && halfedge_twin) {
       return;
     }
@@ -1244,6 +1431,139 @@ struct OpenClRuntime {
     return result;
   }
 
+  std::vector<Vec3> relax_points(
+      const PoseTrainerCache& cache,
+      const std::vector<Vec3>& points,
+      int iterations) {
+    if (points.size() != cache.vertex_count) {
+      throw std::invalid_argument("OpenCL relax point count does not match cache");
+    }
+    ensure_static_buffers(cache);
+    const size_t position_bytes = cache.vertex_count * 3 * sizeof(float);
+    ensure_buffer(animated, position_capacity, position_bytes);
+    ensure_buffer(ping, position_capacity, position_bytes);
+    ensure_buffer(pong, position_capacity, position_bytes);
+
+    write_buffer(animated, points.data(), position_bytes, "write train relax points");
+    cl_mem result_buffer = dispatch_relax(animated, cache.vertex_count, iterations);
+    std::vector<Vec3> result(cache.vertex_count);
+    read_buffer(result_buffer, result.data(), position_bytes, "read train relaxed points");
+    return result;
+  }
+
+  void train_area_models(
+      PoseTrainerCache& cache,
+      const std::vector<float>& rep_positions,
+      int sample_count) {
+    constexpr int kMaxOpenClTrainSamples = 12;
+    if (sample_count <= 0 || sample_count > kMaxOpenClTrainSamples) {
+      throw std::invalid_argument("OpenCL training supports 1 to 12 bind/sample entries");
+    }
+
+    const cl_uint area_count = static_cast<cl_uint>(cache.areas.size());
+    const cl_uint samples = static_cast<cl_uint>(sample_count);
+    if (area_count == 0) {
+      return;
+    }
+    const size_t expected_rep_floats =
+        static_cast<size_t>(area_count) * sample_count * 16 * 3;
+    if (rep_positions.size() != expected_rep_floats) {
+      throw std::invalid_argument("OpenCL training rep position buffer has an unexpected size");
+    }
+
+    const size_t rep_bytes = rep_positions.size() * sizeof(float);
+    const size_t feature_bytes =
+        static_cast<size_t>(area_count) * sample_count * 16 * 3 * sizeof(float);
+    const size_t theta_bytes =
+        static_cast<size_t>(area_count) * sample_count * sample_count * sizeof(float);
+    const size_t scale_bytes = static_cast<size_t>(area_count) * sizeof(float);
+
+    cl_mem rep_buffer = nullptr;
+    cl_mem feature_buffer = nullptr;
+    cl_mem theta_buffer = nullptr;
+    cl_mem scale_buffer = nullptr;
+    auto release_local = [&]() {
+      release(rep_buffer);
+      release(feature_buffer);
+      release(theta_buffer);
+      release(scale_buffer);
+    };
+
+    try {
+      rep_buffer = make_static_buffer(rep_positions.data(), rep_bytes, "train rep positions");
+      size_t feature_capacity = 0;
+      size_t theta_capacity = 0;
+      size_t scale_capacity = 0;
+      ensure_buffer(feature_buffer, feature_capacity, feature_bytes);
+      ensure_buffer(theta_buffer, theta_capacity, theta_bytes);
+      ensure_buffer(scale_buffer, scale_capacity, scale_bytes);
+
+      const float radius = cache.settings.rbf_radius;
+      const float regularization = cache.settings.regularization;
+      cl_uint arg = 0;
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(cl_mem), &rep_buffer), "train arg reps");
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(cl_mem), &feature_buffer), "train arg features");
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(cl_mem), &theta_buffer), "train arg theta");
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(cl_mem), &scale_buffer), "train arg scale");
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(cl_uint), &area_count), "train arg area_count");
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(cl_uint), &samples), "train arg sample_count");
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(float), &radius), "train arg radius");
+      check(cl.clSetKernelArg(train_kernel, arg++, sizeof(float), &regularization), "train arg regularization");
+
+      const size_t global = std::max<size_t>(area_count, 1);
+      check(cl.clEnqueueNDRangeKernel(
+          queue,
+          train_kernel,
+          1,
+          nullptr,
+          &global,
+          nullptr,
+          0,
+          nullptr,
+          nullptr),
+          "train areas kernel");
+
+      std::vector<float> features(static_cast<size_t>(area_count) * sample_count * 16 * 3);
+      std::vector<float> theta(static_cast<size_t>(area_count) * sample_count * sample_count);
+      std::vector<float> scales(area_count, 1.0f);
+      check(cl.clEnqueueReadBuffer(
+          queue, feature_buffer, CL_TRUE_VALUE, 0, feature_bytes, features.data(), 0, nullptr, nullptr),
+          "read train features");
+      check(cl.clEnqueueReadBuffer(
+          queue, theta_buffer, CL_TRUE_VALUE, 0, theta_bytes, theta.data(), 0, nullptr, nullptr),
+          "read train theta");
+      check(cl.clEnqueueReadBuffer(
+          queue, scale_buffer, CL_TRUE_VALUE, 0, scale_bytes, scales.data(), 0, nullptr, nullptr),
+          "read train scale");
+
+      for (AreaModel& area : cache.areas) {
+        const size_t area_id = area.area_id;
+        area.scale = scales[area_id];
+        area.features.assign(sample_count * kRepresentativeVertexCount, {});
+        for (int s = 0; s < sample_count; ++s) {
+          for (int r = 0; r < kRepresentativeVertexCount; ++r) {
+            const size_t src = ((area_id * sample_count + s) * kRepresentativeVertexCount + r) * 3;
+            area.features[s * kRepresentativeVertexCount + r] = {
+                features[src],
+                features[src + 1],
+                features[src + 2]};
+          }
+        }
+        area.theta.assign(sample_count * sample_count, 0.0f);
+        for (int row = 0; row < sample_count; ++row) {
+          for (int col = 0; col < sample_count; ++col) {
+            area.theta[row * sample_count + col] =
+                theta[(area_id * sample_count + row) * sample_count + col];
+          }
+        }
+      }
+      release_local();
+    } catch (...) {
+      release_local();
+      throw;
+    }
+  }
+
   void dispatch_evaluate_areas(cl_mem relaxed, const PoseTrainerCache& cache) {
     const cl_uint area_count = static_cast<cl_uint>(cache.areas.size());
     const cl_uint sample_count = static_cast<cl_uint>(cache.sample_deltas.size() + 1);
@@ -1373,6 +1693,14 @@ struct OpenClRuntime {
   }
 };
 
+std::shared_ptr<OpenClRuntime> shared_opencl_runtime() {
+  static std::shared_ptr<OpenClRuntime> runtime;
+  if (!runtime) {
+    runtime = std::make_shared<OpenClRuntime>(api());
+  }
+  return runtime;
+}
+
 std::vector<Vec3> evaluate_opencl(
     const PoseTrainerCache& cache,
     const std::vector<Vec3>& animated,
@@ -1384,7 +1712,7 @@ std::vector<Vec3> evaluate_opencl(
     return {};
   }
   if (!cache.opencl_runtime) {
-    cache.opencl_runtime = std::make_shared<OpenClRuntime>(api());
+    cache.opencl_runtime = shared_opencl_runtime();
   }
   std::vector<Vec3> out = cache.opencl_runtime->evaluate(
       cache, animated, vertex_mask, envelope, solve_iterations, profile_timing);
@@ -1392,12 +1720,38 @@ std::vector<Vec3> evaluate_opencl(
   return out;
 }
 
+std::vector<Vec3> relax_opencl(
+    const PoseTrainerCache& cache,
+    const std::vector<Vec3>& points,
+    int iterations) {
+  if (cache.vertex_count == 0) {
+    return {};
+  }
+  if (!cache.opencl_runtime) {
+    cache.opencl_runtime = shared_opencl_runtime();
+  }
+  return cache.opencl_runtime->relax_points(cache, points, iterations);
+}
+
+void train_area_models_opencl(
+    PoseTrainerCache& cache,
+    const std::vector<float>& rep_positions,
+    int sample_count) {
+  if (cache.vertex_count == 0 || cache.areas.empty()) {
+    return;
+  }
+  if (!cache.opencl_runtime) {
+    cache.opencl_runtime = shared_opencl_runtime();
+  }
+  cache.opencl_runtime->train_area_models(cache, rep_positions, sample_count);
+}
+
 bool opencl_runtime_available() {
   try {
     if (!api().loaded()) {
       return false;
     }
-    OpenClRuntime runtime(api());
+    shared_opencl_runtime();
     api().status = "OpenCL runtime initialized";
     return true;
   } catch (const std::exception& exc) {

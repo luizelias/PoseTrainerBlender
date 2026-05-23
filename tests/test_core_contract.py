@@ -151,3 +151,31 @@ def test_opencl_matches_cpu_on_tiny_mesh_when_available():
     assert getattr(cache, "last_backend", "") == "OpenCL"
     assert hasattr(cache, "last_opencl_timing")
     assert np.allclose(opencl, cpu, atol=1.0e-5)
+
+
+def test_opencl_training_matches_cpu_training_when_available():
+    if not hasattr(core, "opencl_available") or not core.opencl_available():
+        pytest.skip("OpenCL runtime is not available")
+
+    bind = _square_bind()
+    sample = bind.copy()
+    sample[1, 2] = 0.2
+    sample[2, 2] = 0.5
+    animated = sample.copy()
+    animated[0, 2] = 0.1
+    areas = [{"name": "all", "weights": np.ones(len(bind), dtype=np.float32)}]
+
+    cpu_settings = core.PoseTrainerSettings()
+    cpu_settings.relax_iterations = 1
+    cpu_settings.runtime_backend = 1
+    cpu_cache = core.train(_square_faces(), bind, [sample], areas, cpu_settings)
+
+    opencl_settings = core.PoseTrainerSettings()
+    opencl_settings.relax_iterations = 1
+    opencl_settings.runtime_backend = 2
+    opencl_cache = core.train(_square_faces(), bind, [sample], areas, opencl_settings)
+
+    cpu_trained = cpu_cache.evaluate(animated, None, 1.0, 1, 1)
+    opencl_trained = opencl_cache.evaluate(animated, None, 1.0, 1, 1)
+
+    assert np.allclose(opencl_trained, cpu_trained, atol=1.0e-5)
