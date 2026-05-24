@@ -1,7 +1,5 @@
 #include "opencl_backend.h"
 
-#include <Eigen/Dense>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -24,16 +22,6 @@
 
 namespace pose_trainer {
 namespace {
-
-using Eigen::ComputeFullU;
-using Eigen::ComputeFullV;
-using Eigen::Dynamic;
-using Eigen::JacobiSVD;
-using Eigen::Matrix;
-using Eigen::Matrix3f;
-using Eigen::RowMajor;
-using Eigen::Vector3f;
-using Eigen::VectorXf;
 
 using cl_bool = uint32_t;
 using cl_bitfield = uint64_t;
@@ -201,6 +189,27 @@ uint64_t hash_float_vector(const std::vector<float>& values) {
   return hash;
 }
 
+uint64_t hash_uint_vector(const std::vector<uint32_t>& values) {
+  constexpr uint64_t kOffset = 1469598103934665603ull;
+  constexpr uint64_t kPrime = 1099511628211ull;
+  uint64_t hash = kOffset;
+  auto mix = [&](uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      hash ^= (value >> (i * 8)) & 0xffu;
+      hash *= kPrime;
+    }
+  };
+  mix(values.size());
+  for (uint32_t value : values) {
+    mix(value);
+  }
+  return hash;
+}
+
+void hash_combine(uint64_t& seed, uint64_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+}
+
 std::string kernel_source() {
   return std::string(R"CLC(
 __kernel void relax_neighbors(
@@ -301,11 +310,6 @@ float3 read_point(__global const float* values, uint idx) {
 float3 read_feature(__global const float* features, uint area, uint sample, uint rep, uint sample_count) {
   const uint b = ((area * sample_count + sample) * 16u + rep) * 3u;
   return (float3)(features[b], features[b + 1u], features[b + 2u]);
-}
-
-float3 read_layer_rep(__global const float* layer_rep_bases, uint area, uint layer, uint rep, uint shape_count) {
-  const uint b = ((area * shape_count + layer) * 16u + rep) * 3u;
-  return (float3)(layer_rep_bases[b], layer_rep_bases[b + 1u], layer_rep_bases[b + 2u]);
 }
 
 void identity3(__private float* R) {
@@ -688,12 +692,9 @@ __kernel void evaluate_areas(
     __global const float* theta_values,
     __global const float* scale_values,
     __global const float* feature_values,
-    __global const float* layer_rep_bases,
     __global float* activations,
-    __global float* rotations,
     const uint area_count,
     const uint sample_count,
-    const uint shape_count,
     const float rbf_radius) {
   const uint area = get_global_id(0);
   if (area >= area_count) { return; }
@@ -708,19 +709,6 @@ __kernel void evaluate_areas(
   const float inv_scale = fabs(scale) > 1.0e-10f ? 1.0f / scale : 1.0f;
   for (uint r = 0u; r < 16u; r++) {
     bind_pts[r] = read_feature(feature_values, area, 0u, r, sample_count) * inv_scale;
-  }
-
-  for (uint s = 0u; s < shape_count; s++) {
-    float3 sample_pts[16];
-    for (uint r = 0u; r < 16u; r++) {
-      sample_pts[r] = read_layer_rep(layer_rep_bases, area, s, r, shape_count);
-    }
-    float R[9];
-    procrustes_rotation16(sample_pts, current_pts, R);
-    const uint base = (area * shape_count + s) * 9u;
-    for (uint i = 0u; i < 9u; i++) {
-      rotations[base + i] = R[i];
-    }
   }
 
   float align_R[9];
@@ -763,6 +751,106 @@ __kernel void evaluate_areas(
   }
 }
 
+float3 mat3_column_major_mul(__global const float* values, uint base, float3 v) {
+  return (float3)(
+      values[base] * v.x + values[base + 3u] * v.y + values[base + 6u] * v.z,
+      values[base + 1u] * v.x + values[base + 4u] * v.y + values[base + 7u] * v.z,
+      values[base + 2u] * v.x + values[base + 5u] * v.y + values[base + 8u] * v.z);
+}
+
+uint finite3(float3 v) {
+  return (isfinite(v.x) != 0 && isfinite(v.y) != 0 && isfinite(v.z) != 0) ? 1u : 0u;
+}
+
+uint build_tangent_basis(float3 p1, float3 p2, float3 p3, __private float* out) {
+  const float3 e1_raw = p2 - p1;
+  const float3 e2_raw = p3 - p1;
+  if (finite3(e1_raw) == 0u || finite3(e2_raw) == 0u) {
+    return 0u;
+  }
+  const float3 normal = cross(e1_raw, e2_raw);
+  const float area2 = length(normal);
+  if (!isfinite(area2) || area2 < 1.0e-10f || finite3(normal) == 0u) {
+    return 0u;
+  }
+  out[0] = e1_raw.x; out[1] = e1_raw.y; out[2] = e1_raw.z;
+  out[3] = e2_raw.x; out[4] = e2_raw.y; out[5] = e2_raw.z;
+  out[6] = normal.x; out[7] = normal.y; out[8] = normal.z;
+  return 1u;
+}
+
+__kernel void compute_tangent_frames(
+    __global const float* positions,
+    __global const uint* frame_centers,
+    __global const uint* frame_neighbor_a,
+    __global const uint* frame_neighbor_b,
+    __global float* current_frames,
+    __global uint* current_frame_valid,
+    const uint frame_count) {
+  const uint frame = get_global_id(0);
+  if (frame >= frame_count) { return; }
+  float basis[9];
+  const uint valid = build_tangent_basis(
+      read_point(positions, frame_centers[frame]),
+      read_point(positions, frame_neighbor_a[frame]),
+      read_point(positions, frame_neighbor_b[frame]),
+      basis);
+  current_frame_valid[frame] = valid;
+  const uint base = frame * 9u;
+  for (uint i = 0u; i < 9u; i++) {
+    current_frames[base + i] = valid != 0u ? basis[i] : 0.0f;
+  }
+}
+
+float3 transport_delta(
+    float3 delta,
+    uint vertex,
+    uint sample,
+    __global const uint* frame_offsets,
+    __global const float* sample_base_frame_inverse,
+    __global const uint* sample_base_frame_valid,
+    __global const float* current_frames,
+    __global const uint* current_frame_valid,
+    uint frame_count) {
+  const float delta_len = length(delta);
+  if (delta_len < 0.001f) {
+    return delta;
+  }
+
+  const uint start = frame_offsets[vertex];
+  const uint end = frame_offsets[vertex + 1u];
+  float3 accum = (float3)(0.0f, 0.0f, 0.0f);
+  uint valid_count = 0u;
+  for (uint frame = start; frame < end; frame++) {
+    const uint sample_frame = sample * frame_count + frame;
+    if (current_frame_valid[frame] == 0u || sample_base_frame_valid[sample_frame] == 0u) {
+      continue;
+    }
+    const float3 local_delta = mat3_column_major_mul(sample_base_frame_inverse, sample_frame * 9u, delta);
+    if (finite3(local_delta) == 0u) {
+      continue;
+    }
+    const float3 rotated = mat3_column_major_mul(current_frames, frame * 9u, local_delta);
+    if (finite3(rotated) == 0u) {
+      continue;
+    }
+    accum += rotated;
+    valid_count++;
+  }
+  if (valid_count == 0u) {
+    return delta;
+  }
+  if (finite3(accum) == 0u) {
+    return delta;
+  }
+  float3 average = accum / (float)valid_count;
+  const float average_len = length(average);
+  if (isfinite(average_len) && average_len > 1.0e-8f) {
+    average = average * (delta_len / average_len);
+  }
+  return average;
+}
+
 __kernel void apply_pose_trainer(
     __global const float* smoothed,
     __global const float* animated,
@@ -772,11 +860,16 @@ __kernel void apply_pose_trainer(
     __global const uint* membership_area_ids,
     __global const float* membership_weights,
     __global const float* activations,
-    __global const float* rotations,
+    __global const uint* frame_offsets,
+    __global const float* sample_base_frame_inverse,
+    __global const uint* sample_base_frame_valid,
+    __global const float* current_frames,
+    __global const uint* current_frame_valid,
     __global const float* vertex_mask,
     const uint vertex_count,
     const uint sample_count,
     const uint shape_count,
+    const uint frame_count,
     const float envelope,
     const uint use_mask) {
   const uint v = get_global_id(0);
@@ -818,13 +911,19 @@ __kernel void apply_pose_trainer(
       const float dx = sample_deltas[dbase];
       const float dy = sample_deltas[dbase + 1u];
       const float dz = sample_deltas[dbase + 2u];
-      const uint rbase = (area * shape_count + s) * 9u;
-      const float rx = rotations[rbase] * dx + rotations[rbase + 1u] * dy + rotations[rbase + 2u] * dz;
-      const float ry = rotations[rbase + 3u] * dx + rotations[rbase + 4u] * dy + rotations[rbase + 5u] * dz;
-      const float rz = rotations[rbase + 6u] * dx + rotations[rbase + 7u] * dy + rotations[rbase + 8u] * dz;
-      ax += rx * area_w * activation;
-      ay += ry * area_w * activation;
-      az += rz * area_w * activation;
+      const float3 transported = transport_delta(
+          (float3)(dx, dy, dz),
+          v,
+          s,
+          frame_offsets,
+          sample_base_frame_inverse,
+          sample_base_frame_valid,
+          current_frames,
+          current_frame_valid,
+          frame_count);
+      ax += transported.x * area_w * activation;
+      ay += transported.y * area_w * activation;
+      az += transported.z * area_w * activation;
     }
   }
 
@@ -842,133 +941,6 @@ __kernel void apply_pose_trainer(
   output[base + 2u] = anz * (1.0f - blend) + cz * blend;
 }
 )CLC";
-}
-
-Vec3 operator+(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-Vec3 operator-(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-Vec3 operator*(Vec3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
-Vec3 operator/(Vec3 a, float s) { return {a.x / s, a.y / s, a.z / s}; }
-Vec3& operator+=(Vec3& a, Vec3 b) {
-  a.x += b.x; a.y += b.y; a.z += b.z; return a;
-}
-float dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-float length(Vec3 a) { return std::sqrt(dot(a, a)); }
-Vector3f to_eigen(Vec3 v) { return {v.x, v.y, v.z}; }
-Vec3 from_eigen(const Vector3f& v) { return {v.x(), v.y(), v.z()}; }
-Vec3 mul(const Matrix3f& r, Vec3 v) { return from_eigen(r * to_eigen(v)); }
-
-Vec3 centroid16(const std::array<Vec3, kRepresentativeVertexCount>& points) {
-  Vec3 out;
-  for (Vec3 p : points) {
-    out += p;
-  }
-  return out / static_cast<float>(kRepresentativeVertexCount);
-}
-
-float basis(float distance, float radius) {
-  return 1.0f / std::sqrt(distance * distance + radius * radius);
-}
-
-Matrix3f procrustes_rotation(
-    const std::array<Vec3, kRepresentativeVertexCount>& src,
-    const std::array<Vec3, kRepresentativeVertexCount>& dst) {
-  const Vec3 cs = centroid16(src);
-  const Vec3 cd = centroid16(dst);
-
-  Matrix3f h = Matrix3f::Zero();
-  for (int i = 0; i < kRepresentativeVertexCount; ++i) {
-    h += to_eigen(src[i] - cs) * to_eigen(dst[i] - cd).transpose();
-  }
-  if (h.squaredNorm() < 1.0e-20f) {
-    return Matrix3f::Identity();
-  }
-
-  JacobiSVD<Matrix3f> svd(h, ComputeFullU | ComputeFullV);
-  Matrix3f u = svd.matrixU();
-  Matrix3f v = svd.matrixV();
-  Matrix3f r = v * u.transpose();
-  if (r.determinant() < 0.0f) {
-    v.col(2) *= -1.0f;
-    r = v * u.transpose();
-  }
-  return r;
-}
-
-std::array<Vec3, kRepresentativeVertexCount> gather_reps(
-    const std::vector<Vec3>& points,
-    const std::array<uint32_t, kRepresentativeVertexCount>& reps) {
-  std::array<Vec3, kRepresentativeVertexCount> out{};
-  for (int i = 0; i < kRepresentativeVertexCount; ++i) {
-    out[i] = points[reps[i]];
-  }
-  return out;
-}
-
-std::array<Vec3, kRepresentativeVertexCount> align_points(
-    const std::array<Vec3, kRepresentativeVertexCount>& src,
-    const std::array<Vec3, kRepresentativeVertexCount>& dst) {
-  const Vec3 cs = centroid16(src);
-  const Vec3 cd = centroid16(dst);
-  const Matrix3f r = procrustes_rotation(src, dst);
-  std::array<Vec3, kRepresentativeVertexCount> out{};
-  for (int i = 0; i < kRepresentativeVertexCount; ++i) {
-    out[i] = mul(r, src[i] - cs) + cd;
-  }
-  return out;
-}
-
-std::vector<float> evaluate_area_activations(
-    const PoseTrainerCache& cache,
-    const std::vector<Vec3>& relaxed,
-    std::vector<float>& rotations_out) {
-  const int sample_count = static_cast<int>(cache.sample_deltas.size()) + 1;
-  const int shape_count = static_cast<int>(cache.sample_deltas.size());
-  std::vector<float> activations(cache.areas.size() * sample_count, 0.0f);
-  rotations_out.assign(cache.areas.size() * shape_count * 9, 0.0f);
-
-  for (const AreaModel& area : cache.areas) {
-    const auto current_feature = gather_reps(relaxed, area.reps);
-    const auto bind_feature = gather_reps(cache.bind_relaxed, area.reps);
-    auto aligned_current = align_points(current_feature, bind_feature);
-    for (Vec3& p : aligned_current) {
-      p = p * area.scale;
-    }
-
-    std::vector<float> phi(sample_count, 0.0f);
-    for (int s = 0; s < sample_count; ++s) {
-      float total = 0.0f;
-      for (int r = 0; r < kRepresentativeVertexCount; ++r) {
-        total += basis(length(aligned_current[r] - area.features[s * kRepresentativeVertexCount + r]), cache.settings.rbf_radius);
-      }
-      phi[s] = total / static_cast<float>(kRepresentativeVertexCount);
-    }
-
-    Eigen::Map<const Matrix<float, Dynamic, Dynamic, RowMajor>> theta_matrix(
-        area.theta.data(), sample_count, sample_count);
-    Eigen::Map<const VectorXf> phi_vector(phi.data(), sample_count);
-    const VectorXf raw_vector = theta_matrix * phi_vector;
-    std::vector<float> raw(sample_count, 0.0f);
-    for (int i = 0; i < sample_count; ++i) {
-      raw[i] = raw_vector(i);
-    }
-    const std::vector<float> activation = project_simplex(raw);
-    std::copy(
-        activation.begin(),
-        activation.end(),
-        activations.begin() + static_cast<size_t>(area.area_id) * sample_count);
-
-    for (size_t s = 0; s < cache.sample_deltas.size(); ++s) {
-      const auto sample_feature = gather_reps(cache.sample_relaxed[s], area.reps);
-      const Matrix3f r = procrustes_rotation(sample_feature, current_feature);
-      const size_t base = (static_cast<size_t>(area.area_id) * shape_count + s) * 9;
-      for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-          rotations_out[base + row * 3 + col] = r(row, col);
-        }
-      }
-    }
-  }
-  return activations;
 }
 
 }  // namespace
@@ -1002,6 +974,7 @@ struct OpenClRuntime {
   cl_kernel relax_kernel = nullptr;
   cl_kernel train_kernel = nullptr;
   cl_kernel evaluate_kernel = nullptr;
+  cl_kernel frame_kernel = nullptr;
   cl_kernel apply_kernel = nullptr;
 
   cl_mem halfedge_twin = nullptr;
@@ -1011,25 +984,32 @@ struct OpenClRuntime {
   cl_mem membership_offsets = nullptr;
   cl_mem membership_area_ids = nullptr;
   cl_mem membership_weights = nullptr;
+  cl_mem tangent_frame_offsets = nullptr;
+  cl_mem tangent_frame_centers = nullptr;
+  cl_mem tangent_frame_neighbor_a = nullptr;
+  cl_mem tangent_frame_neighbor_b = nullptr;
+  cl_mem sample_base_frame_inverse = nullptr;
+  cl_mem sample_base_frame_valid = nullptr;
   cl_mem sample_deltas = nullptr;
   cl_mem rep_indices = nullptr;
   cl_mem theta_values = nullptr;
   cl_mem scale_values = nullptr;
   cl_mem feature_values = nullptr;
-  cl_mem layer_rep_bases = nullptr;
   cl_mem animated = nullptr;
   cl_mem ping = nullptr;
   cl_mem pong = nullptr;
   cl_mem output = nullptr;
   cl_mem mask = nullptr;
   cl_mem activations = nullptr;
-  cl_mem rotations = nullptr;
+  cl_mem current_frames = nullptr;
+  cl_mem current_frame_valid = nullptr;
 
   size_t static_key = 0;
   size_t position_capacity = 0;
   size_t mask_capacity = 0;
   size_t activation_capacity = 0;
-  size_t rotation_capacity = 0;
+  size_t current_frame_capacity = 0;
+  size_t current_frame_valid_capacity = 0;
   bool profiling_enabled = false;
   bool mask_uploaded = false;
   bool collect_profile = false;
@@ -1104,6 +1084,8 @@ struct OpenClRuntime {
     check(err, "clCreateKernel(train_areas)");
     evaluate_kernel = cl.clCreateKernel(program, "evaluate_areas", &err);
     check(err, "clCreateKernel(evaluate_areas)");
+    frame_kernel = cl.clCreateKernel(program, "compute_tangent_frames", &err);
+    check(err, "clCreateKernel(compute_tangent_frames)");
     apply_kernel = cl.clCreateKernel(program, "apply_pose_trainer", &err);
     check(err, "clCreateKernel(apply_pose_trainer)");
   }
@@ -1116,22 +1098,29 @@ struct OpenClRuntime {
     release(membership_offsets);
     release(membership_area_ids);
     release(membership_weights);
+    release(tangent_frame_offsets);
+    release(tangent_frame_centers);
+    release(tangent_frame_neighbor_a);
+    release(tangent_frame_neighbor_b);
+    release(sample_base_frame_inverse);
+    release(sample_base_frame_valid);
     release(sample_deltas);
     release(rep_indices);
     release(theta_values);
     release(scale_values);
     release(feature_values);
-    release(layer_rep_bases);
     release(animated);
     release(ping);
     release(pong);
     release(output);
     release(mask);
     release(activations);
-    release(rotations);
+    release(current_frames);
+    release(current_frame_valid);
     if (relax_kernel) cl.clReleaseKernel(relax_kernel);
     if (train_kernel) cl.clReleaseKernel(train_kernel);
     if (evaluate_kernel) cl.clReleaseKernel(evaluate_kernel);
+    if (frame_kernel) cl.clReleaseKernel(frame_kernel);
     if (apply_kernel) cl.clReleaseKernel(apply_kernel);
     release_profile_events();
     if (program) cl.clReleaseProgram(program);
@@ -1265,15 +1254,27 @@ struct OpenClRuntime {
   }
 
   void ensure_static_buffers(const PoseTrainerCache& cache) {
-    const size_t key =
-        reinterpret_cast<size_t>(&cache) ^
-        static_cast<size_t>(cache.vertex_count) ^
-        (cache.areas.size() << 16) ^
-        (cache.sample_deltas_flat.size() << 1) ^
-        (cache.rep_indices_flat.size() << 3) ^
-        (cache.theta_values_flat.size() << 5) ^
-        (cache.feature_values_flat.size() << 7) ^
-        (cache.layer_rep_bases_flat.size() << 9);
+    uint64_t key = 1469598103934665603ull;
+    hash_combine(key, cache.vertex_count);
+    hash_combine(key, cache.areas.size());
+    hash_combine(key, hash_uint_vector(cache.halfedge_twin));
+    hash_combine(key, hash_uint_vector(cache.halfedge_next));
+    hash_combine(key, hash_uint_vector(cache.halfedge_vertex));
+    hash_combine(key, hash_uint_vector(cache.vertex_halfedge));
+    hash_combine(key, hash_uint_vector(cache.membership_offsets));
+    hash_combine(key, hash_uint_vector(cache.membership_area_ids));
+    hash_combine(key, hash_float_vector(cache.membership_weights));
+    hash_combine(key, hash_uint_vector(cache.tangent_frame_offsets));
+    hash_combine(key, hash_uint_vector(cache.tangent_frame_center_indices));
+    hash_combine(key, hash_uint_vector(cache.tangent_frame_neighbor_a));
+    hash_combine(key, hash_uint_vector(cache.tangent_frame_neighbor_b));
+    hash_combine(key, hash_float_vector(cache.sample_base_frame_inverse_flat));
+    hash_combine(key, hash_uint_vector(cache.sample_base_frame_valid_flat));
+    hash_combine(key, hash_float_vector(cache.sample_deltas_flat));
+    hash_combine(key, hash_uint_vector(cache.rep_indices_flat));
+    hash_combine(key, hash_float_vector(cache.theta_values_flat));
+    hash_combine(key, hash_float_vector(cache.scale_values));
+    hash_combine(key, hash_float_vector(cache.feature_values_flat));
     if (static_key == key && halfedge_twin) {
       return;
     }
@@ -1284,12 +1285,17 @@ struct OpenClRuntime {
     release(membership_offsets);
     release(membership_area_ids);
     release(membership_weights);
+    release(tangent_frame_offsets);
+    release(tangent_frame_centers);
+    release(tangent_frame_neighbor_a);
+    release(tangent_frame_neighbor_b);
+    release(sample_base_frame_inverse);
+    release(sample_base_frame_valid);
     release(sample_deltas);
     release(rep_indices);
     release(theta_values);
     release(scale_values);
     release(feature_values);
-    release(layer_rep_bases);
 
     halfedge_twin = make_static_buffer(
         cache.halfedge_twin.data(),
@@ -1319,6 +1325,30 @@ struct OpenClRuntime {
         cache.membership_weights.data(),
         cache.membership_weights.size() * sizeof(float),
         "membership_weights");
+    tangent_frame_offsets = make_static_buffer(
+        cache.tangent_frame_offsets.data(),
+        cache.tangent_frame_offsets.size() * sizeof(uint32_t),
+        "tangent_frame_offsets");
+    tangent_frame_centers = make_static_buffer(
+        cache.tangent_frame_center_indices.data(),
+        cache.tangent_frame_center_indices.size() * sizeof(uint32_t),
+        "tangent_frame_centers");
+    tangent_frame_neighbor_a = make_static_buffer(
+        cache.tangent_frame_neighbor_a.data(),
+        cache.tangent_frame_neighbor_a.size() * sizeof(uint32_t),
+        "tangent_frame_neighbor_a");
+    tangent_frame_neighbor_b = make_static_buffer(
+        cache.tangent_frame_neighbor_b.data(),
+        cache.tangent_frame_neighbor_b.size() * sizeof(uint32_t),
+        "tangent_frame_neighbor_b");
+    sample_base_frame_inverse = make_static_buffer(
+        cache.sample_base_frame_inverse_flat.data(),
+        cache.sample_base_frame_inverse_flat.size() * sizeof(float),
+        "sample_base_frame_inverse");
+    sample_base_frame_valid = make_static_buffer(
+        cache.sample_base_frame_valid_flat.data(),
+        cache.sample_base_frame_valid_flat.size() * sizeof(uint32_t),
+        "sample_base_frame_valid");
     sample_deltas = make_static_buffer(
         cache.sample_deltas_flat.data(),
         cache.sample_deltas_flat.size() * sizeof(float),
@@ -1339,10 +1369,6 @@ struct OpenClRuntime {
         cache.feature_values_flat.data(),
         cache.feature_values_flat.size() * sizeof(float),
         "feature_values");
-    layer_rep_bases = make_static_buffer(
-        cache.layer_rep_bases_flat.data(),
-        cache.layer_rep_bases_flat.size() * sizeof(float),
-        "layer_rep_bases");
     static_key = key;
     relax_static_args_dirty = true;
   }
@@ -1567,12 +1593,9 @@ struct OpenClRuntime {
   void dispatch_evaluate_areas(cl_mem relaxed, const PoseTrainerCache& cache) {
     const cl_uint area_count = static_cast<cl_uint>(cache.areas.size());
     const cl_uint sample_count = static_cast<cl_uint>(cache.sample_deltas.size() + 1);
-    const cl_uint shape_count = static_cast<cl_uint>(cache.sample_deltas.size());
     const float radius = cache.settings.rbf_radius;
     const size_t activation_bytes = static_cast<size_t>(area_count) * sample_count * sizeof(float);
-    const size_t rotation_bytes = static_cast<size_t>(area_count) * shape_count * 9 * sizeof(float);
     ensure_buffer(activations, activation_capacity, activation_bytes);
-    ensure_buffer(rotations, rotation_capacity, rotation_bytes);
 
     const size_t global = std::max<size_t>(area_count, 1);
     cl_uint arg = 0;
@@ -1581,12 +1604,9 @@ struct OpenClRuntime {
     check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_mem), &theta_values), "eval arg theta");
     check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_mem), &scale_values), "eval arg scale");
     check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_mem), &feature_values), "eval arg features");
-    check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_mem), &layer_rep_bases), "eval arg layer bases");
     check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_mem), &activations), "eval arg activations");
-    check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_mem), &rotations), "eval arg rotations");
     check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_uint), &area_count), "eval arg area count");
     check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_uint), &sample_count), "eval arg sample count");
-    check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(cl_uint), &shape_count), "eval arg shape count");
     check(cl.clSetKernelArg(evaluate_kernel, arg++, sizeof(float), &radius), "eval arg radius");
     cl_event event = nullptr;
     check(cl.clEnqueueNDRangeKernel(
@@ -1600,6 +1620,41 @@ struct OpenClRuntime {
         nullptr,
         profile_event_slot(ProfileBucket::Areas, event)),
         "evaluate areas kernel");
+    commit_profile_event(event);
+  }
+
+  void dispatch_compute_tangent_frames(cl_mem relaxed, const PoseTrainerCache& cache) {
+    const cl_uint frame_count = static_cast<cl_uint>(cache.tangent_frame_center_indices.size());
+    const size_t frame_bytes = static_cast<size_t>(frame_count) * 9 * sizeof(float);
+    const size_t valid_bytes = static_cast<size_t>(frame_count) * sizeof(uint32_t);
+    ensure_buffer(current_frames, current_frame_capacity, frame_bytes);
+    ensure_buffer(current_frame_valid, current_frame_valid_capacity, valid_bytes);
+    if (frame_count == 0) {
+      return;
+    }
+
+    const size_t global = ((static_cast<size_t>(frame_count) + 255) / 256) * 256;
+    const size_t local = 256;
+    cl_uint arg = 0;
+    check(cl.clSetKernelArg(frame_kernel, arg++, sizeof(cl_mem), &relaxed), "frame arg positions");
+    check(cl.clSetKernelArg(frame_kernel, arg++, sizeof(cl_mem), &tangent_frame_centers), "frame arg centers");
+    check(cl.clSetKernelArg(frame_kernel, arg++, sizeof(cl_mem), &tangent_frame_neighbor_a), "frame arg neighbor a");
+    check(cl.clSetKernelArg(frame_kernel, arg++, sizeof(cl_mem), &tangent_frame_neighbor_b), "frame arg neighbor b");
+    check(cl.clSetKernelArg(frame_kernel, arg++, sizeof(cl_mem), &current_frames), "frame arg current frames");
+    check(cl.clSetKernelArg(frame_kernel, arg++, sizeof(cl_mem), &current_frame_valid), "frame arg valid");
+    check(cl.clSetKernelArg(frame_kernel, arg++, sizeof(cl_uint), &frame_count), "frame arg count");
+    cl_event event = nullptr;
+    check(cl.clEnqueueNDRangeKernel(
+        queue,
+        frame_kernel,
+        1,
+        nullptr,
+        &global,
+        &local,
+        0,
+        nullptr,
+        profile_event_slot(ProfileBucket::Apply, event)),
+        "compute tangent frames kernel");
     commit_profile_event(event);
   }
 
@@ -1622,6 +1677,7 @@ struct OpenClRuntime {
     cl_uint vertex_count = cache.vertex_count;
     cl_uint sample_count = static_cast<cl_uint>(cache.sample_deltas.size() + 1);
     cl_uint shape_count = static_cast<cl_uint>(cache.sample_deltas.size());
+    cl_uint frame_count = static_cast<cl_uint>(cache.tangent_frame_center_indices.size());
     cl_uint use_mask = vertex_mask.empty() ? 0u : 1u;
     const size_t global = ((static_cast<size_t>(vertex_count) + 255) / 256) * 256;
     const size_t local = 256;
@@ -1636,11 +1692,16 @@ struct OpenClRuntime {
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &membership_area_ids), "apply arg area ids");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &membership_weights), "apply arg weights");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &activations), "apply arg activations");
-    check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &rotations), "apply arg rotations");
+    check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &tangent_frame_offsets), "apply arg frame offsets");
+    check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &sample_base_frame_inverse), "apply arg base frame inverse");
+    check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &sample_base_frame_valid), "apply arg base frame valid");
+    check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &current_frames), "apply arg current frames");
+    check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &current_frame_valid), "apply arg current frame valid");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_mem), &mask_arg), "apply arg mask");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_uint), &vertex_count), "apply arg vertex_count");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_uint), &sample_count), "apply arg sample_count");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_uint), &shape_count), "apply arg shape_count");
+    check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_uint), &frame_count), "apply arg frame_count");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(float), &envelope), "apply arg envelope");
     check(cl.clSetKernelArg(apply_kernel, arg++, sizeof(cl_uint), &use_mask), "apply arg use_mask");
     cl_event event = nullptr;
@@ -1682,6 +1743,7 @@ struct OpenClRuntime {
     for (int iter = 0; iter < solve_iterations; ++iter) {
       relaxed_buf = dispatch_relax(current_buf, cache.vertex_count, cache.settings.relax_iterations);
       dispatch_evaluate_areas(relaxed_buf, cache);
+      dispatch_compute_tangent_frames(relaxed_buf, cache);
       dispatch_apply(relaxed_buf, cache, vertex_mask, envelope);
       current_buf = output;
     }

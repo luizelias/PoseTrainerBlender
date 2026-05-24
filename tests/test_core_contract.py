@@ -153,6 +153,31 @@ def test_opencl_matches_cpu_on_tiny_mesh_when_available():
     assert np.allclose(opencl, cpu, atol=1.0e-5)
 
 
+def test_opencl_reuploads_static_buffers_for_same_sized_retraining_when_available():
+    if not hasattr(core, "opencl_available") or not core.opencl_available():
+        pytest.skip("OpenCL runtime is not available")
+
+    settings = core.PoseTrainerSettings()
+    settings.relax_iterations = 1
+    bind = _square_bind()
+    areas = [{"name": "all", "weights": np.ones(len(bind), dtype=np.float32)}]
+
+    first_sample = bind.copy()
+    first_sample[2, 2] = 0.5
+    first_cache = core.train(_square_faces(), bind, [first_sample], areas, settings)
+    first_cache.evaluate(first_sample, None, 1.0, 1, 2, True)
+
+    second_sample = bind.copy()
+    second_sample[1, 2] = -0.35
+    second_sample[2, 2] = 0.2
+    second_cache = core.train(_square_faces(), bind, [second_sample], areas, settings)
+
+    cpu = second_cache.evaluate(second_sample, None, 1.0, 1, 1)
+    opencl = second_cache.evaluate(second_sample, None, 1.0, 1, 2, True)
+
+    assert np.allclose(opencl, cpu, atol=1.0e-5)
+
+
 def test_opencl_training_matches_cpu_training_when_available():
     if not hasattr(core, "opencl_available") or not core.opencl_available():
         pytest.skip("OpenCL runtime is not available")

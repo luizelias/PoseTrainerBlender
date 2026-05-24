@@ -28,6 +28,8 @@ using Eigen::VectorXf;
 constexpr uint32_t kBoundaryHalfedge = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kMaxFaceVerts = 64;
 constexpr uint32_t kMaxRing = 128;
+constexpr float kTangentFrameAreaEpsilon = 1e-10f;
+constexpr float kTangentFrameDeterminantEpsilon = 1e-20f;
 
 struct EdgeKey {
   uint32_t tail = 0;
@@ -75,6 +77,10 @@ float dot(Vec3 a, Vec3 b) {
 
 float length(Vec3 a) {
   return std::sqrt(dot(a, a));
+}
+
+bool is_finite(Vec3 v) {
+  return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 
 Vector3f to_eigen(Vec3 v) {
@@ -266,6 +272,245 @@ void visit_mush3d_halfedge_ring(
     add_neighbor(halfedge_vertex[twin]);
     previous = halfedge_prev_of(halfedge_next, twin);
   }
+}
+
+std::pair<std::vector<uint32_t>, bool> ordered_halfedge_ring(
+    const std::vector<uint32_t>& halfedge_twin,
+    const std::vector<uint32_t>& halfedge_next,
+    const std::vector<uint32_t>& halfedge_vertex,
+    const std::vector<uint32_t>& vertex_halfedge,
+    uint32_t vertex) {
+  std::vector<uint32_t> ring;
+  const uint32_t start_he = vertex_halfedge[vertex];
+  if (start_he == kBoundaryHalfedge) {
+    return {ring, false};
+  }
+
+  const bool start_is_boundary = halfedge_twin[start_he] == kBoundaryHalfedge;
+  if (!start_is_boundary) {
+    uint32_t he = start_he;
+    for (uint32_t i = 0; i < kMaxRing; ++i) {
+      ring.push_back(halfedge_vertex[he]);
+      const uint32_t twin = halfedge_twin[he];
+      if (twin == kBoundaryHalfedge) {
+        break;
+      }
+      he = halfedge_next[twin];
+      if (he == start_he) {
+        break;
+      }
+    }
+    return {ring, false};
+  }
+
+  ring.push_back(halfedge_vertex[start_he]);
+  uint32_t previous = halfedge_prev_of(halfedge_next, start_he);
+  for (uint32_t i = 0; i < kMaxRing; ++i) {
+    const uint32_t twin = halfedge_twin[previous];
+    if (twin == kBoundaryHalfedge) {
+      ring.push_back(halfedge_vertex[halfedge_prev_of(halfedge_next, previous)]);
+      break;
+    }
+    ring.push_back(halfedge_vertex[twin]);
+    previous = halfedge_prev_of(halfedge_next, twin);
+  }
+  return {ring, true};
+}
+
+void add_triangle_frame(
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& frames_by_vertex,
+    uint32_t center,
+    uint32_t neighbor_a,
+    uint32_t neighbor_b) {
+  if (center >= frames_by_vertex.size() ||
+      neighbor_a >= frames_by_vertex.size() ||
+      neighbor_b >= frames_by_vertex.size()) {
+    throw std::invalid_argument("face index out of range");
+  }
+  frames_by_vertex[center].push_back({neighbor_a, neighbor_b});
+}
+
+void build_tangent_frame_table(
+    PoseTrainerCache& cache,
+    const std::vector<std::vector<uint32_t>>& faces) {
+  cache.tangent_frame_offsets.assign(cache.vertex_count + 1, 0);
+  cache.tangent_frame_center_indices.clear();
+  cache.tangent_frame_neighbor_a.clear();
+  cache.tangent_frame_neighbor_b.clear();
+
+  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> frames_by_vertex(cache.vertex_count);
+  for (const auto& face : faces) {
+    if (face.size() < 3) {
+      continue;
+    }
+    for (size_t i = 1; i + 1 < face.size(); ++i) {
+      const uint32_t a = face[0];
+      const uint32_t b = face[i];
+      const uint32_t c = face[i + 1];
+      add_triangle_frame(frames_by_vertex, a, b, c);
+      add_triangle_frame(frames_by_vertex, b, c, a);
+      add_triangle_frame(frames_by_vertex, c, a, b);
+    }
+  }
+
+  for (uint32_t v = 0; v < cache.vertex_count; ++v) {
+    for (const auto& frame : frames_by_vertex[v]) {
+      cache.tangent_frame_center_indices.push_back(v);
+      cache.tangent_frame_neighbor_a.push_back(frame.first);
+      cache.tangent_frame_neighbor_b.push_back(frame.second);
+    }
+    cache.tangent_frame_offsets[v + 1] = static_cast<uint32_t>(cache.tangent_frame_center_indices.size());
+  }
+}
+
+bool tangent_basis(
+    const std::vector<Vec3>& points,
+    uint32_t center,
+    uint32_t neighbor_a,
+    uint32_t neighbor_b,
+    Matrix3f& out) {
+  const Vec3 p1 = points[center];
+  const Vec3 p2 = points[neighbor_a];
+  const Vec3 p3 = points[neighbor_b];
+  const Vector3f e1_raw = to_eigen(p2 - p1);
+  const Vector3f e2_raw = to_eigen(p3 - p1);
+  if (!e1_raw.allFinite() || !e2_raw.allFinite()) {
+    out = Matrix3f::Identity();
+    return false;
+  }
+  const Vector3f normal = e1_raw.cross(e2_raw);
+  const float area2 = normal.norm();
+  if (!std::isfinite(area2) || area2 < kTangentFrameAreaEpsilon || !normal.allFinite()) {
+    out = Matrix3f::Identity();
+    return false;
+  }
+
+  out.col(0) = e1_raw;
+  out.col(1) = e2_raw;
+  out.col(2) = normal;
+  return true;
+}
+
+void pack_column_major_matrix(const Matrix3f& matrix, std::vector<float>& values, size_t base) {
+  for (int col = 0; col < 3; ++col) {
+    for (int row = 0; row < 3; ++row) {
+      values[base + static_cast<size_t>(col) * 3 + row] = matrix(row, col);
+    }
+  }
+}
+
+void compute_tangent_frames_cpu(
+    const PoseTrainerCache& cache,
+    const std::vector<Vec3>& points,
+    std::vector<float>& frames,
+    std::vector<uint32_t>& valid) {
+  const size_t frame_count = cache.tangent_frame_center_indices.size();
+  frames.assign(frame_count * 9, 0.0f);
+  valid.assign(frame_count, 0);
+  for (size_t frame = 0; frame < frame_count; ++frame) {
+    Matrix3f basis_matrix;
+    if (!tangent_basis(
+            points,
+            cache.tangent_frame_center_indices[frame],
+            cache.tangent_frame_neighbor_a[frame],
+            cache.tangent_frame_neighbor_b[frame],
+            basis_matrix)) {
+      continue;
+    }
+    valid[frame] = 1;
+    pack_column_major_matrix(basis_matrix, frames, frame * 9);
+  }
+}
+
+void pack_sample_base_frames(PoseTrainerCache& cache) {
+  const size_t shape_count = cache.sample_relaxed.size();
+  const size_t frame_count = cache.tangent_frame_center_indices.size();
+  cache.sample_base_frame_inverse_flat.assign(shape_count * frame_count * 9, 0.0f);
+  cache.sample_base_frame_valid_flat.assign(shape_count * frame_count, 0);
+
+  for (size_t s = 0; s < shape_count; ++s) {
+    for (size_t frame = 0; frame < frame_count; ++frame) {
+      Matrix3f basis_matrix;
+      if (!tangent_basis(
+              cache.sample_relaxed[s],
+              cache.tangent_frame_center_indices[frame],
+              cache.tangent_frame_neighbor_a[frame],
+              cache.tangent_frame_neighbor_b[frame],
+              basis_matrix)) {
+        continue;
+      }
+      const float determinant = basis_matrix.determinant();
+      if (!std::isfinite(determinant) || std::abs(determinant) < kTangentFrameDeterminantEpsilon) {
+        continue;
+      }
+      const Matrix3f inverse_matrix = basis_matrix.inverse();
+      if (!inverse_matrix.allFinite()) {
+        continue;
+      }
+      cache.sample_base_frame_valid_flat[s * frame_count + frame] = 1;
+      pack_column_major_matrix(
+          inverse_matrix,
+          cache.sample_base_frame_inverse_flat,
+          (s * frame_count + frame) * 9);
+    }
+  }
+}
+
+Vec3 mul_column_major_matrix(const std::vector<float>& values, size_t base, Vec3 v) {
+  return {
+      values[base] * v.x + values[base + 3] * v.y + values[base + 6] * v.z,
+      values[base + 1] * v.x + values[base + 4] * v.y + values[base + 7] * v.z,
+      values[base + 2] * v.x + values[base + 5] * v.y + values[base + 8] * v.z};
+}
+
+Vec3 transport_sample_delta(
+    const PoseTrainerCache& cache,
+    const std::vector<float>& current_frames,
+    const std::vector<uint32_t>& current_frame_valid,
+    size_t sample,
+    uint32_t vertex,
+    Vec3 delta) {
+  const float delta_len = length(delta);
+  if (delta_len < 0.001f) {
+    return delta;
+  }
+
+  const size_t frame_count = cache.tangent_frame_center_indices.size();
+  const uint32_t start = cache.tangent_frame_offsets[vertex];
+  const uint32_t end = cache.tangent_frame_offsets[vertex + 1];
+  Vec3 sum;
+  uint32_t valid_count = 0;
+  for (uint32_t frame = start; frame < end; ++frame) {
+    if (current_frame_valid[frame] == 0 ||
+        cache.sample_base_frame_valid_flat[sample * frame_count + frame] == 0) {
+      continue;
+    }
+    const Vec3 local_delta = mul_column_major_matrix(
+        cache.sample_base_frame_inverse_flat,
+        (sample * frame_count + frame) * 9,
+        delta);
+    if (!is_finite(local_delta)) {
+      continue;
+    }
+    const Vec3 rotated = mul_column_major_matrix(current_frames, static_cast<size_t>(frame) * 9, local_delta);
+    if (!is_finite(rotated)) {
+      continue;
+    }
+    sum += rotated;
+    valid_count++;
+  }
+  if (valid_count == 0) {
+    return delta;
+  }
+  if (!is_finite(sum)) {
+    return delta;
+  }
+  Vec3 average = sum / static_cast<float>(valid_count);
+  const float average_len = length(average);
+  if (std::isfinite(average_len) && average_len > 1e-8f) {
+    average = average * (delta_len / average_len);
+  }
+  return average;
 }
 
 std::vector<Vec3> relax(
@@ -556,12 +801,10 @@ void pack_sample_deltas(PoseTrainerCache& cache) {
 
 void pack_opencl_area_data(PoseTrainerCache& cache, int sample_count) {
   const size_t area_count = cache.areas.size();
-  const size_t shape_count = cache.sample_deltas.size();
   cache.rep_indices_flat.assign(area_count * kRepresentativeVertexCount, 0);
   cache.feature_values_flat.assign(area_count * sample_count * kRepresentativeVertexCount * 3, 0.0f);
   cache.theta_values_flat.assign(area_count * sample_count * sample_count, 0.0f);
   cache.scale_values.assign(area_count, 1.0f);
-  cache.layer_rep_bases_flat.assign(area_count * shape_count * kRepresentativeVertexCount * 3, 0.0f);
 
   for (const AreaModel& area : cache.areas) {
     const size_t area_id = area.area_id;
@@ -569,13 +812,6 @@ void pack_opencl_area_data(PoseTrainerCache& cache, int sample_count) {
     for (int r = 0; r < kRepresentativeVertexCount; ++r) {
       const uint32_t rep = area.reps[r];
       cache.rep_indices_flat[area_id * kRepresentativeVertexCount + r] = rep;
-      for (size_t s = 0; s < shape_count; ++s) {
-        const Vec3 p = cache.sample_relaxed[s][rep];
-        const size_t base = ((area_id * shape_count + s) * kRepresentativeVertexCount + r) * 3;
-        cache.layer_rep_bases_flat[base] = p.x;
-        cache.layer_rep_bases_flat[base + 1] = p.y;
-        cache.layer_rep_bases_flat[base + 2] = p.z;
-      }
     }
 
     for (int s = 0; s < sample_count; ++s) {
@@ -599,12 +835,9 @@ void pack_opencl_area_data(PoseTrainerCache& cache, int sample_count) {
 
 std::vector<float> evaluate_area_activations(
     const PoseTrainerCache& cache,
-    const std::vector<Vec3>& relaxed,
-    std::vector<float>& rotations_out) {
+    const std::vector<Vec3>& relaxed) {
   const int sample_count = static_cast<int>(cache.sample_deltas.size()) + 1;
-  const int shape_count = static_cast<int>(cache.sample_deltas.size());
   std::vector<float> activations(cache.areas.size() * sample_count, 0.0f);
-  rotations_out.assign(cache.areas.size() * shape_count * 9, 0.0f);
 
   for (const AreaModel& area : cache.areas) {
     const auto current_feature = gather_reps(relaxed, area.reps);
@@ -636,17 +869,6 @@ std::vector<float> evaluate_area_activations(
         activation.begin(),
         activation.end(),
         activations.begin() + static_cast<size_t>(area.area_id) * sample_count);
-
-    for (size_t s = 0; s < cache.sample_deltas.size(); ++s) {
-      const auto sample_feature = gather_reps(cache.sample_relaxed[s], area.reps);
-      const Matrix3f r = procrustes_rotation(sample_feature, current_feature);
-      const size_t base = (static_cast<size_t>(area.area_id) * shape_count + s) * 9;
-      for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-          rotations_out[base + row * 3 + col] = r(row, col);
-        }
-      }
-    }
   }
   return activations;
 }
@@ -705,6 +927,7 @@ PoseTrainerCache train(
   cache.neighbors = build_neighbors(cache.vertex_count, faces);
   pack_neighbor_csr(cache);
   build_halfedges(cache.vertex_count, faces, cache);
+  build_tangent_frame_table(cache, faces);
 
   // OpenCL training is still experimental; keep Auto on the proven CPU path
   // while explicit OpenCL remains available for parity and profiling.
@@ -814,6 +1037,7 @@ PoseTrainerCache train(
   }
   pack_membership_csr(cache);
   pack_sample_deltas(cache);
+  pack_sample_base_frames(cache);
   pack_opencl_area_data(cache, sample_count);
 
   return cache;
@@ -866,8 +1090,10 @@ std::vector<Vec3> PoseTrainerCache::evaluate(
     }
 
     std::vector<Vec3> accum(vertex_count);
-    std::vector<float> rotations;
-    const std::vector<float> activation_flat = evaluate_area_activations(*this, relaxed, rotations);
+    std::vector<float> current_frames;
+    std::vector<uint32_t> current_frame_valid;
+    compute_tangent_frames_cpu(*this, relaxed, current_frames, current_frame_valid);
+    const std::vector<float> activation_flat = evaluate_area_activations(*this, relaxed);
 
     for (const AreaModel& area : areas) {
       for (size_t i = 0; i < area.active_vertices.size(); ++i) {
@@ -876,14 +1102,14 @@ std::vector<Vec3> PoseTrainerCache::evaluate(
         const size_t activation_base = static_cast<size_t>(area.area_id) * sample_count;
         accum[v] += pose_delta[v] * (area_w * activation_flat[activation_base]);
         for (size_t s = 0; s < sample_deltas.size(); ++s) {
-          const size_t rot_base = (static_cast<size_t>(area.area_id) * sample_deltas.size() + s) * 9;
-          Matrix3f rotation;
-          for (int row = 0; row < 3; ++row) {
-            for (int col = 0; col < 3; ++col) {
-              rotation(row, col) = rotations[rot_base + row * 3 + col];
-            }
-          }
-          accum[v] += mul(rotation, sample_deltas[s][v]) * (area_w * activation_flat[activation_base + s + 1]);
+          const Vec3 transported = transport_sample_delta(
+              *this,
+              current_frames,
+              current_frame_valid,
+              s,
+              v,
+              sample_deltas[s][v]);
+          accum[v] += transported * (area_w * activation_flat[activation_base + s + 1]);
         }
       }
     }

@@ -63,12 +63,17 @@ struct PoseTrainerCache {
   std::vector<uint32_t> membership_offsets;
   std::vector<uint32_t> membership_area_ids;
   std::vector<float> membership_weights;
+  std::vector<uint32_t> tangent_frame_offsets;
+  std::vector<uint32_t> tangent_frame_center_indices;
+  std::vector<uint32_t> tangent_frame_neighbor_a;
+  std::vector<uint32_t> tangent_frame_neighbor_b;
+  std::vector<float> sample_base_frame_inverse_flat;
+  std::vector<uint32_t> sample_base_frame_valid_flat;
   std::vector<float> sample_deltas_flat;
   std::vector<uint32_t> rep_indices_flat;
   std::vector<float> feature_values_flat;
   std::vector<float> theta_values_flat;
   std::vector<float> scale_values;
-  std::vector<float> layer_rep_bases_flat;
   mutable std::shared_ptr<OpenClRuntime> opencl_runtime;
   mutable std::string last_backend = "CPU";
   mutable std::string last_opencl_timing;
