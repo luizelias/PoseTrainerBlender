@@ -18,11 +18,47 @@ def _mark_training_stale(self, _context):
         self.status = "Training settings changed; retrain Pose Trainer"
 
 
+def _mark_sample_training_stale(context):
+    if context is None or getattr(context, "scene", None) is None:
+        return
+    settings = getattr(context.scene, "pose_trainer", None)
+    if settings is None:
+        return
+    if getattr(settings, "trained", False):
+        settings.trained = False
+        settings.status = "Sample settings changed; retrain Pose Trainer"
+
+
+def _sample_changed(_self, context):
+    _mark_sample_training_stale(context)
+
+
+def _sample_bind_pose_changed(self, context):
+    if context is None or getattr(context, "scene", None) is None:
+        return
+    settings = getattr(context.scene, "pose_trainer", None)
+    if settings is None:
+        return
+    if self.is_bind_pose:
+        self_pointer = self.as_pointer()
+        for item in settings.samples:
+            if item.as_pointer() != self_pointer and item.is_bind_pose:
+                item.is_bind_pose = False
+    _mark_sample_training_stale(context)
+
+
 class PT_SampleItem(bpy.types.PropertyGroup):
     object: bpy.props.PointerProperty(
         name="Sample",
         type=bpy.types.Object,
         poll=lambda _self, obj: obj.type == "MESH",
+        update=_sample_changed,
+    )
+    is_bind_pose: bpy.props.BoolProperty(
+        name="Bind Mesh",
+        description="Use this mesh as the bind/rest pose reference for Pose Trainer training",
+        default=False,
+        update=_sample_bind_pose_changed,
     )
 
 
@@ -69,7 +105,7 @@ class PT_Settings(bpy.types.PropertyGroup):
     )
 
     relax_iterations: bpy.props.IntProperty(
-        name="Relax",
+        name="Mesh Relax",
         default=10,
         min=1,
         max=50,
@@ -84,7 +120,7 @@ class PT_Settings(bpy.types.PropertyGroup):
         update=_mark_training_stale,
     )
     solve_iterations: bpy.props.IntProperty(
-        name="Solve",
+        name="Solve Iterations",
         default=1,
         min=1,
         max=5,
@@ -101,7 +137,7 @@ class PT_Settings(bpy.types.PropertyGroup):
         update=_refresh_output_after_setting_change,
     )
     rbf_radius: bpy.props.FloatProperty(
-        name="RBF Radius",
+        name="Activation Radius",
         default=0.1,
         min=0.0001,
         update=_mark_training_stale,
@@ -121,6 +157,7 @@ class PT_Settings(bpy.types.PropertyGroup):
         update=_refresh_output_after_setting_change,
     )
 
+    show_advanced: bpy.props.BoolProperty(name="Advanced", default=False)
     live_update: bpy.props.BoolProperty(name="Live Update", default=False)
     profile_timing: bpy.props.BoolProperty(
         name="Profile Timing",

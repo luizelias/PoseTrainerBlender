@@ -20,8 +20,9 @@ The `REFERENCE` directory is the algorithm reference and should remain read-only
 
 ## Current Add-On Features
 
-- Source, bind, corrective sample, output, area, mask, and solver settings in
-  `View3D > Sidebar > Pose Trainer`.
+- Simple Source -> Training Meshes -> Train workflow in
+  `View3D > Sidebar > Pose Trainer`. The training list marks exactly one
+  object as the Bind Mesh, and training creates automatic deformation masks.
 - Output-object workflow: the source object is not mutated during evaluation.
 - C++/Eigen training and evaluation through the compiled Python extension.
 - Optional OpenCL runtime backend for live evaluation. The current OpenCL path

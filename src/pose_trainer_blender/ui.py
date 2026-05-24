@@ -6,7 +6,10 @@ import bpy
 class PT_UL_samples(bpy.types.UIList):
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
         name = item.object.name if item.object else "Missing sample"
-        layout.label(text=name, icon="MESH_DATA")
+        split = layout.split(factor=0.58)
+        split.label(text=name, icon="MESH_DATA")
+        bind_column = split.row(align=True)
+        bind_column.prop(item, "is_bind_pose", text="Bind Mesh")
 
 
 class PT_UL_areas(bpy.types.UIList):
@@ -21,67 +24,49 @@ class PT_PT_panel(bpy.types.Panel):
     bl_region_type = "UI"
     bl_category = "Pose Trainer"
 
+    def _section(self, layout, title, icon):
+        box = layout.box()
+        box.label(text=title, icon=icon)
+        return box
+
     def draw(self, context):
         layout = self.layout
         settings = context.scene.pose_trainer
 
-        layout.prop(settings, "source_object")
-        layout.prop(settings, "bind_object")
-        layout.prop(settings, "output_object")
-        layout.operator("pose_trainer.create_output", icon="MESH_DATA")
+        layout.use_property_split = True
+        layout.use_property_decorate = False
 
-        layout.separator()
-        row = layout.row()
-        row.template_list("PT_UL_samples", "", settings, "samples", settings, "sample_index", rows=3)
+        setup = self._section(layout, "1. Source", "OUTLINER_OB_MESH")
+        setup.prop(settings, "source_object")
+        setup.prop(settings, "output_object", text="Result")
+
+        samples = self._section(layout, "2. Training Meshes", "SHAPEKEY_DATA")
+        row = samples.row()
+        row.template_list("PT_UL_samples", "", settings, "samples", settings, "sample_index", rows=4)
         column = row.column(align=True)
         column.operator("pose_trainer.add_selected_samples", text="", icon="ADD")
         remove = column.operator("pose_trainer.remove_sample", text="", icon="REMOVE")
         remove.index = settings.sample_index
 
-        layout.separator()
-        row = layout.row()
-        row.template_list("PT_UL_areas", "", settings, "areas", settings, "area_index", rows=3)
-        column = row.column(align=True)
-        column.operator("pose_trainer.add_active_area_group", text="", icon="ADD")
-        remove = column.operator("pose_trainer.remove_area", text="", icon="REMOVE")
-        remove.index = settings.area_index
-        auto_row = layout.row(align=True)
-        auto_row.prop(settings, "auto_mask_area_count")
-        auto_row.prop(settings, "auto_mask_softness")
-        layout.operator("pose_trainer.auto_mask", icon="MOD_VERTEX_WEIGHT")
-        layout.operator("pose_trainer.preview_auto_mask", icon="COLOR")
-        layout.operator("pose_trainer.extract_areas_from_uv_shells", icon="GROUP_VERTEX")
-        layout.operator("pose_trainer.clear_masking", icon="TRASH")
-        if settings.source_object:
-            layout.prop_search(settings, "mask_group", settings.source_object, "vertex_groups", text="Mask")
-        else:
-            layout.prop(settings, "mask_group", text="Mask")
-
-        layout.separator()
-        grid = layout.grid_flow(columns=2, even_columns=True)
-        grid.prop(settings, "relax_iterations")
-        grid.prop(settings, "area_relax_iterations")
-        grid.prop(settings, "solve_iterations")
-        grid.prop(settings, "runtime_backend")
-        grid.prop(settings, "rbf_radius")
-        grid.prop(settings, "regularization")
-        layout.prop(settings, "envelope", slider=True)
-
-        layout.separator()
-        row = layout.row(align=True)
-        row.operator("pose_trainer.train", icon="PLAY")
-        row.operator("pose_trainer.evaluate_once", icon="FILE_REFRESH")
+        train = self._section(layout, "3. Train", "PLAY")
+        train.prop(settings, "envelope", slider=True)
+        train.operator("pose_trainer.train", text="Train Pose Trainer", icon="PLAY")
         icon = "PAUSE" if settings.live_update else "PLAY"
-        layout.operator("pose_trainer.toggle_live_update", icon=icon, depress=settings.live_update)
-        layout.prop(settings, "profile_timing")
-        if settings.last_train_timing:
-            layout.label(text=settings.last_train_timing)
-        if settings.profile_timing and settings.last_eval_timing:
-            layout.label(text=settings.last_eval_timing)
-            if settings.last_eval_blender_timing:
-                layout.label(text=settings.last_eval_blender_timing)
-            if settings.last_eval_gpu_timing:
-                layout.label(text=settings.last_eval_gpu_timing)
-            layout.operator("pose_trainer.copy_profile_timing", text="Copy Timing")
-        if not (settings.profile_timing and settings.last_eval_timing and settings.status.startswith(settings.last_eval_timing)):
-            layout.label(text=settings.status)
+        train.operator("pose_trainer.toggle_live_update", text="Live Update", icon=icon, depress=settings.live_update)
+
+        advanced_row = layout.row()
+        icon = "TRIA_DOWN" if settings.show_advanced else "TRIA_RIGHT"
+        advanced_row.prop(settings, "show_advanced", text="Advanced", icon=icon, emboss=False)
+        if settings.show_advanced:
+            advanced = layout.box()
+            grid = advanced.grid_flow(columns=2, even_columns=True)
+            grid.prop(settings, "relax_iterations")
+            grid.prop(settings, "area_relax_iterations")
+            grid.prop(settings, "solve_iterations")
+            grid.prop(settings, "runtime_backend")
+            grid.prop(settings, "rbf_radius")
+            grid.prop(settings, "auto_mask_area_count")
+            grid.prop(settings, "auto_mask_softness")
+
+        layout.separator()
+        layout.label(text=settings.status, icon="INFO")

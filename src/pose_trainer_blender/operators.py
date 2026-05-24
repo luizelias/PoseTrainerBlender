@@ -350,14 +350,19 @@ class PT_OT_add_selected_samples(bpy.types.Operator):
     def execute(self, context):
         settings = get_settings(context)
         existing = {item.object for item in settings.samples}
+        has_bind_pose = any(item.is_bind_pose for item in settings.samples)
         for obj in context.selected_objects:
             if obj.type != "MESH" or obj in existing:
                 continue
-            if obj in {settings.source_object, settings.bind_object, settings.output_object}:
+            if obj in {settings.source_object, settings.output_object}:
                 continue
             item = settings.samples.add()
             item.object = obj
+            if not has_bind_pose:
+                item.is_bind_pose = True
+                has_bind_pose = True
             existing.add(obj)
+            settings.trained = False
         settings.status = f"{len(settings.samples)} sample(s) configured"
         return {"FINISHED"}
 
@@ -372,8 +377,11 @@ class PT_OT_remove_sample(bpy.types.Operator):
     def execute(self, context):
         settings = get_settings(context)
         if 0 <= self.index < len(settings.samples):
+            was_bind_pose = settings.samples[self.index].is_bind_pose
             settings.samples.remove(self.index)
             settings.sample_index = min(settings.sample_index, max(0, len(settings.samples) - 1))
+            if was_bind_pose and len(settings.samples) > 0:
+                settings.samples[settings.sample_index].is_bind_pose = True
             settings.trained = False
         return {"FINISHED"}
 
@@ -668,13 +676,27 @@ class PT_OT_train(bpy.types.Operator):
 
     def execute(self, context):
         settings = get_settings(context)
+        window_manager = context.window_manager
+
+        def update_progress(value: float, message: str) -> None:
+            window_manager.progress_update(int(max(0.0, min(1.0, value)) * 100))
+            settings.status = message
+
         try:
-            runtime.train_scene(context)
+            window_manager.progress_begin(0, 100)
+            update_progress(0.0, "Starting Pose Trainer")
+            runtime.train_scene(context, progress=update_progress)
+            trained_status = settings.status
+            update_progress(0.95, "Updating result mesh")
             runtime.evaluate_scene(context)
+            if settings.status == "Updating result mesh":
+                settings.status = trained_status
         except Exception as exc:
             settings.status = str(exc)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        finally:
+            window_manager.progress_end()
         return {"FINISHED"}
 
 

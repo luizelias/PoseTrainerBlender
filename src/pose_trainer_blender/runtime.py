@@ -2,17 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Optional
+from typing import Callable, Optional
 
 import bpy
 import numpy as np
 from bpy.app.handlers import persistent
 
+from .auto_masking import generate_auto_mask_areas
 from .core_loader import load_core
 
 
 _CACHE_BY_SCENE_ID: dict[int, object] = {}
 _HANDLER_RUNNING = False
+PROFILE_TIMING_ENABLED = False
+VERTEX_MASK_ENABLED = False
+AUTO_MASK_GROUP_PREFIX = "PT_AutoMask_"
 
 
 @dataclass
@@ -80,6 +84,66 @@ def _collect_area_weights(settings, vertex_count: int) -> list[dict]:
     return areas
 
 
+def _remove_area_entries(settings) -> None:
+    for index in range(len(settings.areas) - 1, -1, -1):
+        settings.areas.remove(index)
+    settings.area_index = 0
+
+
+def _create_weighted_vertex_group(source: bpy.types.Object, group_name: str, weights: dict[int, float]) -> None:
+    group = source.vertex_groups.get(group_name)
+    if group is not None:
+        source.vertex_groups.remove(group)
+    group = source.vertex_groups.new(name=group_name)
+    for vertex_index, weight in sorted(weights.items()):
+        group.add([vertex_index], float(weight), "REPLACE")
+
+
+def _create_auto_areas(settings, snapshot: MeshSnapshot) -> int:
+    source = settings.source_object
+    if source is None:
+        raise ValueError("Choose a source object")
+    if snapshot.faces is None:
+        raise ValueError("Automatic masks need source mesh topology")
+    if len(source.data.vertices) != len(snapshot.positions):
+        raise ValueError("Automatic masks require the source mesh to keep the same vertex count after evaluation")
+
+    generated_names = [group.name for group in source.vertex_groups if group.name.startswith(AUTO_MASK_GROUP_PREFIX)]
+    for group_name in sorted(generated_names, reverse=True):
+        group = source.vertex_groups.get(group_name)
+        if group is not None:
+            source.vertex_groups.remove(group)
+
+    auto_areas = generate_auto_mask_areas(
+        snapshot.faces,
+        snapshot.positions.tolist(),
+        area_count=settings.auto_mask_area_count,
+        softness_iterations=settings.auto_mask_softness,
+    )
+    if not auto_areas:
+        raise ValueError("Automatic masks found no usable deformation areas")
+
+    _remove_area_entries(settings)
+    for area_index, auto_area in enumerate(auto_areas, start=1):
+        group_name = f"{AUTO_MASK_GROUP_PREFIX}{area_index:03d}"
+        _create_weighted_vertex_group(source, group_name, auto_area.weights)
+        area = settings.areas.add()
+        area.group_name = group_name
+
+    settings.area_index = min(settings.area_index, max(0, len(settings.areas) - 1))
+    return len(auto_areas)
+
+
+def _bind_sample_index(settings) -> int:
+    bind_indices = [index for index, item in enumerate(settings.samples) if item.is_bind_pose]
+    if len(bind_indices) != 1:
+        raise ValueError("Mark exactly one sample as the bind pose")
+    bind_index = bind_indices[0]
+    if settings.samples[bind_index].object is None:
+        raise ValueError("The bind pose sample is missing its mesh object")
+    return bind_index
+
+
 def _ensure_output(settings, snapshot: MeshSnapshot) -> bpy.types.Object:
     source = settings.source_object
     output = settings.output_object
@@ -120,27 +184,34 @@ def create_output(context: bpy.types.Context) -> bpy.types.Object:
     return _ensure_output(settings, snapshot)
 
 
-def train_scene(context: bpy.types.Context) -> None:
+def train_scene(context: bpy.types.Context, progress: Optional[Callable[[float, str], None]] = None) -> None:
+    def update_progress(value: float, message: str) -> None:
+        if progress is not None:
+            progress(value, message)
+
     settings = context.scene.pose_trainer
     total_start = perf_counter()
     if settings.source_object is None:
         raise ValueError("Choose a source object")
-    if settings.bind_object is None:
-        raise ValueError("Choose a bind object")
-    if len(settings.samples) == 0:
-        raise ValueError("Add at least one corrective sample")
+    if len(settings.samples) < 2:
+        raise ValueError("Add a bind pose sample and at least one corrective sample")
+    bind_index = _bind_sample_index(settings)
 
+    update_progress(0.05, "Reading training meshes")
     depsgraph = context.evaluated_depsgraph_get()
     read_start = perf_counter()
     source_snapshot = _evaluated_mesh_snapshot(settings.source_object, depsgraph)
-    bind_snapshot = _evaluated_mesh_snapshot(settings.bind_object, depsgraph)
     vertex_count = len(source_snapshot.positions)
 
+    bind_item = settings.samples[bind_index]
+    bind_snapshot = _evaluated_mesh_snapshot(bind_item.object, depsgraph)
     if len(bind_snapshot.positions) != vertex_count:
-        raise ValueError("Bind object vertex count does not match source")
+        raise ValueError(f"Bind pose sample {bind_item.object.name} vertex count does not match source")
 
     samples = []
-    for item in settings.samples:
+    for index, item in enumerate(settings.samples):
+        if index == bind_index:
+            continue
         if item.object is None:
             continue
         sample = _evaluated_mesh_snapshot(item.object, depsgraph)
@@ -148,12 +219,16 @@ def train_scene(context: bpy.types.Context) -> None:
             raise ValueError(f"Sample {item.object.name} vertex count does not match source")
         samples.append(sample.positions)
     if not samples:
-        raise ValueError("No valid sample objects are configured")
+        raise ValueError("Add at least one corrective sample in addition to the bind pose")
     read_ms = _elapsed_ms(read_start)
 
+    update_progress(0.30, "Creating automatic masks")
     area_start = perf_counter()
+    area_count = _create_auto_areas(settings, source_snapshot)
     areas = _collect_area_weights(settings, vertex_count)
     area_ms = _elapsed_ms(area_start)
+
+    update_progress(0.45, "Training Pose Trainer core")
     core = load_core()
     core_settings = core.PoseTrainerSettings()
     core_settings.relax_iterations = settings.relax_iterations
@@ -172,13 +247,19 @@ def train_scene(context: bpy.types.Context) -> None:
     core_start = perf_counter()
     cache = core.train(source_snapshot.faces, bind_snapshot.positions, samples, areas, core_settings)
     core_ms = _elapsed_ms(core_start)
+
+    update_progress(0.90, "Preparing result mesh")
     _CACHE_BY_SCENE_ID[_scene_key(context.scene)] = cache
     settings.trained = True
     total_ms = _elapsed_ms(total_start)
     settings.last_train_timing = (
         f"Train {total_ms:.1f} ms | read {read_ms:.1f}, areas {area_ms:.1f}, core {core_ms:.1f}"
     )
-    settings.status = f"Trained {len(samples)} sample(s), {len(areas)} area(s) with Pose Trainer core"
+    update_progress(1.0, "Training complete")
+    settings.status = (
+        f"Trained {len(samples)} corrective sample(s) + bind {bind_item.object.name}, "
+        f"{area_count} automatic area(s) with Pose Trainer core"
+    )
     _ensure_output(settings, source_snapshot)
 
 
@@ -213,7 +294,7 @@ def _evaluate_scene_with_depsgraph(scene: bpy.types.Scene, depsgraph: bpy.types.
 
     mask_start = perf_counter()
     mask = None
-    if settings.mask_group:
+    if VERTEX_MASK_ENABLED and settings.mask_group:
         mask = _vertex_group_weights(settings.source_object, settings.mask_group, len(source_snapshot.positions), 1.0)
     mask_ms = _elapsed_ms(mask_start)
 
@@ -224,7 +305,7 @@ def _evaluate_scene_with_depsgraph(scene: bpy.types.Scene, depsgraph: bpy.types.
         settings.envelope,
         settings.solve_iterations,
         int(settings.runtime_backend),
-        settings.profile_timing,
+        PROFILE_TIMING_ENABLED and settings.profile_timing,
     )
     core_ms = _elapsed_ms(core_start)
 
@@ -233,7 +314,7 @@ def _evaluate_scene_with_depsgraph(scene: bpy.types.Scene, depsgraph: bpy.types.
     write_ms = _elapsed_ms(write_start)
 
     total_ms = _elapsed_ms(total_start)
-    if settings.profile_timing:
+    if PROFILE_TIMING_ENABLED and settings.profile_timing:
         gpu_timing = getattr(cache, "last_opencl_timing", "")
         backend = getattr(cache, "last_backend", "CPU")
         settings.last_eval_timing = f"Eval {total_ms:.1f} ms [{backend}]"
