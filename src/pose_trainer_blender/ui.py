@@ -45,7 +45,13 @@ class PT_PT_panel(bpy.types.Panel):
         column.operator("pose_trainer.add_active_area_group", text="", icon="ADD")
         remove = column.operator("pose_trainer.remove_area", text="", icon="REMOVE")
         remove.index = settings.area_index
+        auto_row = layout.row(align=True)
+        auto_row.prop(settings, "auto_mask_area_count")
+        auto_row.prop(settings, "auto_mask_softness")
+        layout.operator("pose_trainer.auto_mask", icon="MOD_VERTEX_WEIGHT")
+        layout.operator("pose_trainer.preview_auto_mask", icon="COLOR")
         layout.operator("pose_trainer.extract_areas_from_uv_shells", icon="GROUP_VERTEX")
+        layout.operator("pose_trainer.clear_masking", icon="TRASH")
         if settings.source_object:
             layout.prop_search(settings, "mask_group", settings.source_object, "vertex_groups", text="Mask")
         else:

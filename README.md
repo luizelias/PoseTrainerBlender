@@ -35,6 +35,13 @@ The `REFERENCE` directory is the algorithm reference and should remain read-only
 - UV shell extraction for area masks: use `Areas From UV Shells` on a source
   mesh with an active UV map to create `PT_UVShell_###` vertex groups and add
   them as Pose Trainer deformation areas.
+- Auto Mask generation: use `Auto Mask` to create deterministic
+  `PT_AutoMask_###` vertex groups from topology-aware local clustering, with
+  compact softened boundaries suitable for Pose Trainer deformation areas.
+- Auto Mask preview: use `Preview Auto Mask` to create a non-rendering colored
+  preview mesh that displays the generated regions and blended boundaries.
+- Clear generated masking with `Clear Masking`, which removes Pose Trainer area
+  assignments, generated Auto Mask/UV shell groups, and the preview object.
 
 ## Build
 

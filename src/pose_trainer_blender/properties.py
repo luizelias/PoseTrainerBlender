@@ -53,6 +53,20 @@ class PT_Settings(bpy.types.PropertyGroup):
     areas: bpy.props.CollectionProperty(type=PT_AreaItem)
     area_index: bpy.props.IntProperty(default=0)
     mask_group: bpy.props.StringProperty(name="Mask Group")
+    auto_mask_area_count: bpy.props.IntProperty(
+        name="Auto Areas",
+        default=32,
+        min=1,
+        max=512,
+        description="Target number of generated local deformation areas",
+    )
+    auto_mask_softness: bpy.props.IntProperty(
+        name="Auto Softness",
+        default=2,
+        min=0,
+        max=8,
+        description="Number of local boundary smoothing passes for generated auto masks",
+    )
 
     relax_iterations: bpy.props.IntProperty(
         name="Relax",
