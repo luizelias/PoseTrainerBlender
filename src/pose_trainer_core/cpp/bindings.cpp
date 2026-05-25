@@ -37,6 +37,28 @@ py::array_t<float> vec3_to_array(const std::vector<Vec3>& values) {
   return out;
 }
 
+float* writable_vec3_array_data(
+    py::array_t<float, py::array::c_style> array,
+    uint32_t vertex_count,
+    const char* name) {
+  py::buffer_info info = array.request();
+  if (info.readonly) {
+    throw std::invalid_argument(std::string(name) + " must be writable");
+  }
+  if (info.ndim != 2 || info.shape[1] != 3 || info.shape[0] != static_cast<py::ssize_t>(vertex_count)) {
+    throw std::invalid_argument(std::string(name) + " must be an Nx3 float array matching the cache vertex count");
+  }
+  return static_cast<float*>(info.ptr);
+}
+
+void write_vec3_array(const std::vector<Vec3>& values, float* data) {
+  for (size_t i = 0; i < values.size(); ++i) {
+    data[i * 3] = values[i].x;
+    data[i * 3 + 1] = values[i].y;
+    data[i * 3 + 2] = values[i].z;
+  }
+}
+
 std::vector<std::vector<uint32_t>> parse_faces(py::object faces) {
   std::vector<std::vector<uint32_t>> out;
   for (py::handle face_handle : faces) {
@@ -127,6 +149,26 @@ py::array_t<float> evaluate_py(
       profile_timing));
 }
 
+void evaluate_into_py(
+    const PoseTrainerCache& cache,
+    py::array_t<float, py::array::c_style | py::array::forcecast> animated,
+    py::array_t<float, py::array::c_style> output,
+    py::object vertex_mask,
+    float envelope,
+    int solve_iterations,
+    int runtime_backend,
+    bool profile_timing) {
+  float* output_data = writable_vec3_array_data(output, cache.vertex_count, "output");
+  const std::vector<Vec3> values = cache.evaluate(
+      array_to_vec3(animated, "animated"),
+      parse_mask(vertex_mask),
+      envelope,
+      solve_iterations,
+      runtime_backend,
+      profile_timing);
+  write_vec3_array(values, output_data);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_pose_trainer_core, m) {
@@ -147,6 +189,14 @@ PYBIND11_MODULE(_pose_trainer_core, m) {
       .def_property_readonly("last_opencl_timing", [](const PoseTrainerCache& cache) { return cache.last_opencl_timing; })
       .def("evaluate", &evaluate_py,
            py::arg("animated"),
+           py::arg("vertex_mask") = py::none(),
+           py::arg("envelope") = 1.0f,
+           py::arg("solve_iterations") = 0,
+           py::arg("runtime_backend") = -1,
+           py::arg("profile_timing") = false)
+      .def("evaluate_into", &evaluate_into_py,
+           py::arg("animated"),
+           py::arg("output"),
            py::arg("vertex_mask") = py::none(),
            py::arg("envelope") = 1.0f,
            py::arg("solve_iterations") = 0,

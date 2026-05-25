@@ -1015,8 +1015,11 @@ struct OpenClRuntime {
   cl_mem current_frames = nullptr;
   cl_mem current_frame_valid = nullptr;
 
-  size_t static_key = 0;
-  size_t position_capacity = 0;
+  uint64_t static_key = 0;
+  size_t animated_capacity = 0;
+  size_t ping_capacity = 0;
+  size_t pong_capacity = 0;
+  size_t output_capacity = 0;
   size_t mask_capacity = 0;
   size_t activation_capacity = 0;
   size_t current_frame_capacity = 0;
@@ -1265,28 +1268,8 @@ struct OpenClRuntime {
   }
 
   void ensure_static_buffers(const PoseTrainerCache& cache) {
-    uint64_t key = 1469598103934665603ull;
-    hash_combine(key, cache.vertex_count);
-    hash_combine(key, cache.areas.size());
-    hash_combine(key, hash_uint_vector(cache.halfedge_twin));
-    hash_combine(key, hash_uint_vector(cache.halfedge_next));
-    hash_combine(key, hash_uint_vector(cache.halfedge_vertex));
-    hash_combine(key, hash_uint_vector(cache.vertex_halfedge));
-    hash_combine(key, hash_uint_vector(cache.membership_offsets));
-    hash_combine(key, hash_uint_vector(cache.membership_area_ids));
-    hash_combine(key, hash_float_vector(cache.membership_weights));
-    hash_combine(key, hash_uint_vector(cache.tangent_frame_offsets));
-    hash_combine(key, hash_uint_vector(cache.tangent_frame_center_indices));
-    hash_combine(key, hash_uint_vector(cache.tangent_frame_neighbor_a));
-    hash_combine(key, hash_uint_vector(cache.tangent_frame_neighbor_b));
-    hash_combine(key, hash_float_vector(cache.sample_base_frame_inverse_flat));
-    hash_combine(key, hash_uint_vector(cache.sample_base_frame_valid_flat));
-    hash_combine(key, hash_float_vector(cache.sample_deltas_flat));
-    hash_combine(key, hash_uint_vector(cache.rep_indices_flat));
-    hash_combine(key, hash_float_vector(cache.theta_values_flat));
-    hash_combine(key, hash_float_vector(cache.scale_values));
-    hash_combine(key, hash_float_vector(cache.feature_values_flat));
-    if (static_key == key && halfedge_twin) {
+    const uint64_t key = cache.opencl_static_key;
+    if (key != 0 && static_key == key && halfedge_twin) {
       return;
     }
     release(halfedge_twin);
@@ -1477,9 +1460,9 @@ struct OpenClRuntime {
     }
     ensure_static_buffers(cache);
     const size_t position_bytes = cache.vertex_count * 3 * sizeof(float);
-    ensure_buffer(animated, position_capacity, position_bytes);
-    ensure_buffer(ping, position_capacity, position_bytes);
-    ensure_buffer(pong, position_capacity, position_bytes);
+    ensure_buffer(animated, animated_capacity, position_bytes);
+    ensure_buffer(ping, ping_capacity, position_bytes);
+    ensure_buffer(pong, pong_capacity, position_bytes);
 
     write_buffer(animated, points.data(), position_bytes, "write train relax points");
     cl_mem result_buffer = dispatch_relax(animated, cache.vertex_count, iterations);
@@ -1741,10 +1724,10 @@ struct OpenClRuntime {
     begin_profile(profile_timing);
 
     const size_t position_bytes = cache.vertex_count * 3 * sizeof(float);
-    ensure_buffer(animated, position_capacity, position_bytes);
-    ensure_buffer(ping, position_capacity, position_bytes);
-    ensure_buffer(pong, position_capacity, position_bytes);
-    ensure_buffer(output, position_capacity, position_bytes);
+    ensure_buffer(animated, animated_capacity, position_bytes);
+    ensure_buffer(ping, ping_capacity, position_bytes);
+    ensure_buffer(pong, pong_capacity, position_bytes);
+    ensure_buffer(output, output_capacity, position_bytes);
 
     write_buffer(animated, animated_cpu.data(), position_bytes, "write animated");
 
@@ -1767,11 +1750,14 @@ struct OpenClRuntime {
 };
 
 std::shared_ptr<OpenClRuntime> shared_opencl_runtime() {
-  static std::shared_ptr<OpenClRuntime> runtime;
-  if (!runtime) {
-    runtime = std::make_shared<OpenClRuntime>(api());
+  // Keep the OpenCL runtime alive until process exit. Some Windows OpenCL
+  // drivers do not tolerate releasing command queues/contexts during Blender's
+  // Python shutdown sequence after extension-module teardown has started.
+  static auto* runtime = new std::shared_ptr<OpenClRuntime>();
+  if (!*runtime) {
+    *runtime = std::make_shared<OpenClRuntime>(api());
   }
-  return runtime;
+  return *runtime;
 }
 
 std::vector<Vec3> evaluate_opencl(

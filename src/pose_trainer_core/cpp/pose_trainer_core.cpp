@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -849,6 +850,71 @@ void pack_opencl_area_data(PoseTrainerCache& cache, int sample_count) {
   }
 }
 
+uint64_t hash_float_vector(const std::vector<float>& values) {
+  constexpr uint64_t kOffset = 1469598103934665603ull;
+  constexpr uint64_t kPrime = 1099511628211ull;
+  uint64_t hash = kOffset;
+  auto mix = [&](uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      hash ^= (value >> (i * 8)) & 0xffu;
+      hash *= kPrime;
+    }
+  };
+  mix(values.size());
+  for (float value : values) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    mix(bits);
+  }
+  return hash;
+}
+
+uint64_t hash_uint_vector(const std::vector<uint32_t>& values) {
+  constexpr uint64_t kOffset = 1469598103934665603ull;
+  constexpr uint64_t kPrime = 1099511628211ull;
+  uint64_t hash = kOffset;
+  auto mix = [&](uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      hash ^= (value >> (i * 8)) & 0xffu;
+      hash *= kPrime;
+    }
+  };
+  mix(values.size());
+  for (uint32_t value : values) {
+    mix(value);
+  }
+  return hash;
+}
+
+void hash_combine(uint64_t& seed, uint64_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+}
+
+uint64_t build_opencl_static_key(const PoseTrainerCache& cache) {
+  uint64_t key = 1469598103934665603ull;
+  hash_combine(key, cache.vertex_count);
+  hash_combine(key, cache.areas.size());
+  hash_combine(key, hash_uint_vector(cache.halfedge_twin));
+  hash_combine(key, hash_uint_vector(cache.halfedge_next));
+  hash_combine(key, hash_uint_vector(cache.halfedge_vertex));
+  hash_combine(key, hash_uint_vector(cache.vertex_halfedge));
+  hash_combine(key, hash_uint_vector(cache.membership_offsets));
+  hash_combine(key, hash_uint_vector(cache.membership_area_ids));
+  hash_combine(key, hash_float_vector(cache.membership_weights));
+  hash_combine(key, hash_uint_vector(cache.tangent_frame_offsets));
+  hash_combine(key, hash_uint_vector(cache.tangent_frame_center_indices));
+  hash_combine(key, hash_uint_vector(cache.tangent_frame_neighbor_a));
+  hash_combine(key, hash_uint_vector(cache.tangent_frame_neighbor_b));
+  hash_combine(key, hash_float_vector(cache.sample_base_frame_inverse_flat));
+  hash_combine(key, hash_uint_vector(cache.sample_base_frame_valid_flat));
+  hash_combine(key, hash_float_vector(cache.sample_deltas_flat));
+  hash_combine(key, hash_uint_vector(cache.rep_indices_flat));
+  hash_combine(key, hash_float_vector(cache.theta_values_flat));
+  hash_combine(key, hash_float_vector(cache.scale_values));
+  hash_combine(key, hash_float_vector(cache.feature_values_flat));
+  return key == 0 ? 1 : key;
+}
+
 std::vector<float> evaluate_area_activations(
     const PoseTrainerCache& cache,
     const std::vector<Vec3>& relaxed) {
@@ -1055,6 +1121,7 @@ PoseTrainerCache train(
   pack_sample_deltas(cache);
   pack_sample_base_frames(cache);
   pack_opencl_area_data(cache, sample_count);
+  cache.opencl_static_key = build_opencl_static_key(cache);
 
   return cache;
 }

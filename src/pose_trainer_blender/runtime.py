@@ -13,6 +13,8 @@ from .core_loader import load_core
 
 
 _CACHE_BY_SCENE_ID: dict[int, object] = {}
+_EVAL_POSITION_BUFFER_BY_SCENE_ID: dict[int, np.ndarray] = {}
+_EVAL_OUTPUT_BUFFER_BY_SCENE_ID: dict[int, np.ndarray] = {}
 _HANDLER_RUNNING = False
 PROFILE_TIMING_ENABLED = False
 VERTEX_MASK_ENABLED = False
@@ -34,18 +36,42 @@ def _elapsed_ms(start: float) -> float:
     return (perf_counter() - start) * 1000.0
 
 
+def _cached_float3_buffer(store: dict[int, np.ndarray], scene: bpy.types.Scene, vertex_count: int) -> np.ndarray:
+    key = _scene_key(scene)
+    buffer = store.get(key)
+    if (
+        buffer is None
+        or buffer.shape != (vertex_count, 3)
+        or buffer.dtype != np.float32
+        or not buffer.flags.c_contiguous
+    ):
+        buffer = np.empty((vertex_count, 3), dtype=np.float32)
+        store[key] = buffer
+    return buffer
+
+
 def _evaluated_mesh_snapshot(
     obj: bpy.types.Object,
     depsgraph: bpy.types.Depsgraph,
     include_faces: bool = True,
+    positions_buffer: Optional[np.ndarray] = None,
 ) -> MeshSnapshot:
     evaluated = obj.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh()
     try:
-        positions = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
-        mesh.vertices.foreach_get("co", positions)
+        vertex_count = len(mesh.vertices)
+        if (
+            positions_buffer is not None
+            and positions_buffer.shape == (vertex_count, 3)
+            and positions_buffer.dtype == np.float32
+            and positions_buffer.flags.c_contiguous
+        ):
+            positions = positions_buffer
+        else:
+            positions = np.empty((vertex_count, 3), dtype=np.float32)
+        mesh.vertices.foreach_get("co", positions.reshape(-1))
         faces = [list(poly.vertices) for poly in mesh.polygons] if include_faces else None
-        return MeshSnapshot(positions.reshape((-1, 3)), len(mesh.polygons), faces)
+        return MeshSnapshot(positions, len(mesh.polygons), faces)
     finally:
         evaluated.to_mesh_clear()
 
@@ -172,7 +198,11 @@ def _write_output_mesh(output: bpy.types.Object, positions: np.ndarray) -> None:
     mesh = output.data
     if len(mesh.vertices) != len(positions):
         raise ValueError("Output mesh topology does not match evaluated source")
-    mesh.vertices.foreach_set("co", np.asarray(positions, dtype=np.float32).reshape(-1))
+    if isinstance(positions, np.ndarray) and positions.dtype == np.float32 and positions.flags.c_contiguous:
+        flat_positions = positions.reshape(-1)
+    else:
+        flat_positions = np.asarray(positions, dtype=np.float32).reshape(-1)
+    mesh.vertices.foreach_set("co", flat_positions)
     mesh.update()
 
 
@@ -273,7 +303,14 @@ def _evaluate_scene_with_depsgraph(scene: bpy.types.Scene, depsgraph: bpy.types.
         raise ValueError("Choose a source object")
 
     read_start = perf_counter()
-    source_snapshot = _evaluated_mesh_snapshot(settings.source_object, depsgraph, include_faces=False)
+    scene_key = _scene_key(scene)
+    source_snapshot = _evaluated_mesh_snapshot(
+        settings.source_object,
+        depsgraph,
+        include_faces=False,
+        positions_buffer=_EVAL_POSITION_BUFFER_BY_SCENE_ID.get(scene_key),
+    )
+    _EVAL_POSITION_BUFFER_BY_SCENE_ID[scene_key] = source_snapshot.positions
     read_ms = _elapsed_ms(read_start)
 
     topology_start = perf_counter()
@@ -285,7 +322,13 @@ def _evaluate_scene_with_depsgraph(scene: bpy.types.Scene, depsgraph: bpy.types.
         or len(output.data.polygons) != source_snapshot.polygon_count
     )
     if needs_faces:
-        source_snapshot = _evaluated_mesh_snapshot(settings.source_object, depsgraph, include_faces=True)
+        source_snapshot = _evaluated_mesh_snapshot(
+            settings.source_object,
+            depsgraph,
+            include_faces=True,
+            positions_buffer=_EVAL_POSITION_BUFFER_BY_SCENE_ID.get(scene_key),
+        )
+        _EVAL_POSITION_BUFFER_BY_SCENE_ID[scene_key] = source_snapshot.positions
     topology_read_ms = _elapsed_ms(topology_start)
 
     output_start = perf_counter()
@@ -299,14 +342,26 @@ def _evaluate_scene_with_depsgraph(scene: bpy.types.Scene, depsgraph: bpy.types.
     mask_ms = _elapsed_ms(mask_start)
 
     core_start = perf_counter()
-    positions = cache.evaluate(
-        source_snapshot.positions,
-        mask,
-        settings.envelope,
-        settings.solve_iterations,
-        int(settings.runtime_backend),
-        PROFILE_TIMING_ENABLED and settings.profile_timing,
-    )
+    if hasattr(cache, "evaluate_into"):
+        positions = _cached_float3_buffer(_EVAL_OUTPUT_BUFFER_BY_SCENE_ID, scene, len(source_snapshot.positions))
+        cache.evaluate_into(
+            source_snapshot.positions,
+            positions,
+            mask,
+            settings.envelope,
+            settings.solve_iterations,
+            int(settings.runtime_backend),
+            PROFILE_TIMING_ENABLED and settings.profile_timing,
+        )
+    else:
+        positions = cache.evaluate(
+            source_snapshot.positions,
+            mask,
+            settings.envelope,
+            settings.solve_iterations,
+            int(settings.runtime_backend),
+            PROFILE_TIMING_ENABLED and settings.profile_timing,
+        )
     core_ms = _elapsed_ms(core_start)
 
     write_start = perf_counter()
@@ -371,3 +426,5 @@ def unregister_handlers() -> None:
     if _frame_change_handler in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(_frame_change_handler)
     _CACHE_BY_SCENE_ID.clear()
+    _EVAL_POSITION_BUFFER_BY_SCENE_ID.clear()
+    _EVAL_OUTPUT_BUFFER_BY_SCENE_ID.clear()

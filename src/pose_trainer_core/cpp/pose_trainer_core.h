@@ -74,6 +74,7 @@ struct PoseTrainerCache {
   std::vector<float> feature_values_flat;
   std::vector<float> theta_values_flat;
   std::vector<float> scale_values;
+  uint64_t opencl_static_key = 0;
   mutable std::shared_ptr<OpenClRuntime> opencl_runtime;
   mutable std::string last_backend = "CPU";
   mutable std::string last_opencl_timing;
