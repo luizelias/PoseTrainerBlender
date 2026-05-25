@@ -768,14 +768,25 @@ uint build_tangent_basis(float3 p1, float3 p2, float3 p3, __private float* out) 
   if (finite3(e1_raw) == 0u || finite3(e2_raw) == 0u) {
     return 0u;
   }
-  const float3 normal = cross(e1_raw, e2_raw);
-  const float area2 = length(normal);
-  if (!isfinite(area2) || area2 < 1.0e-10f || finite3(normal) == 0u) {
+  // Gram-Schmidt orthonormal frame, matching the Mush3D sculpt deformer
+  // (sculpt-apply-deltas.wgsl buildBasis) and the CPU tangent_basis(). Must
+  // stay identical to the CPU path so base frames (packed on host) and current
+  // frames (built here) are consistent.
+  const float len1 = length(e1_raw);
+  const float len2 = length(e2_raw);
+  if (!(len1 > 0.001f) || !(len2 > 0.001f)) {
     return 0u;
   }
-  out[0] = e1_raw.x; out[1] = e1_raw.y; out[2] = e1_raw.z;
-  out[3] = e2_raw.x; out[4] = e2_raw.y; out[5] = e2_raw.z;
-  out[6] = normal.x; out[7] = normal.y; out[8] = normal.z;
+  const float3 e1 = e1_raw / len1;
+  const float3 e2_temp = e2_raw / len2;
+  if (length(cross(e1, e2_temp)) < 0.001f) {
+    return 0u;
+  }
+  const float3 e3 = normalize(cross(e2_temp, e1));
+  const float3 e2 = normalize(cross(e1, e3));
+  out[0] = e1.x; out[1] = e1.y; out[2] = e1.z;
+  out[3] = e2.x; out[4] = e2.y; out[5] = e2.z;
+  out[6] = e3.x; out[7] = e3.y; out[8] = e3.z;
   return 1u;
 }
 

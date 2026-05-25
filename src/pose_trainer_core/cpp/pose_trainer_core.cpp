@@ -28,7 +28,8 @@ using Eigen::VectorXf;
 constexpr uint32_t kBoundaryHalfedge = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kMaxFaceVerts = 64;
 constexpr uint32_t kMaxRing = 128;
-constexpr float kTangentFrameAreaEpsilon = 1e-10f;
+constexpr float kTangentFrameEdgeEpsilon = 0.001f;
+constexpr float kTangentFrameParallelEpsilon = 0.001f;
 constexpr float kTangentFrameDeterminantEpsilon = 1e-20f;
 
 struct EdgeKey {
@@ -378,16 +379,31 @@ bool tangent_basis(
     out = Matrix3f::Identity();
     return false;
   }
-  const Vector3f normal = e1_raw.cross(e2_raw);
-  const float area2 = normal.norm();
-  if (!std::isfinite(area2) || area2 < kTangentFrameAreaEpsilon || !normal.allFinite()) {
+
+  // Gram-Schmidt orthonormal frame, matching the Mush3D sculpt deformer
+  // (sculpt-apply-deltas.wgsl buildBasis). An orthonormal basis makes the
+  // transport poseFrame * baseFrame^T a pure rotation, so triangle scale and
+  // shear no longer leak into the transported delta. The raw edge frame
+  // [e1, e2, normal] used previously amplified tiny/sliver triangles (e.g.
+  // around fingernails) by ~1/area, producing directional noise there.
+  const float len1 = e1_raw.norm();
+  const float len2 = e2_raw.norm();
+  if (!(len1 > kTangentFrameEdgeEpsilon) || !(len2 > kTangentFrameEdgeEpsilon)) {
     out = Matrix3f::Identity();
     return false;
   }
+  const Vector3f e1 = e1_raw / len1;
+  const Vector3f e2_temp = e2_raw / len2;
+  if (e1.cross(e2_temp).norm() < kTangentFrameParallelEpsilon) {
+    out = Matrix3f::Identity();
+    return false;
+  }
+  const Vector3f e3 = e2_temp.cross(e1).normalized();
+  const Vector3f e2 = e1.cross(e3).normalized();
 
-  out.col(0) = e1_raw;
-  out.col(1) = e2_raw;
-  out.col(2) = normal;
+  out.col(0) = e1;
+  out.col(1) = e2;
+  out.col(2) = e3;
   return true;
 }
 
